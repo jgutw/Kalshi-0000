@@ -1,0 +1,19 @@
+# requirements.txt — Kalshi multi-asset bot
+
+# Core
+numpy>=1.26
+scipy>=1.12
+requests>=2.31
+websockets>=12.0
+python-dotenv>=1.0
+
+# Kalshi RSA-PSS auth
+cryptography>=42.0
+
+# Dashboard
+streamlit>=1.35
+pandas>=2.2
+plotly>=5.0
+
+# Optional (nice to have)
+colorama>=0.4.6

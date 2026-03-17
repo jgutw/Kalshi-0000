@@ -1,0 +1,14 @@
+.env
+simulation.json
+paper_trades.jsonl
+btc5m_sim.json
+btc5m_trades.jsonl
+btc5m_decisions.jsonl
+kalshi_*.jsonl
+kalshi_sim.json
+logs/
+config_override.json
+__pycache__/
+*.pyc
+venv/
+run_*.txt
