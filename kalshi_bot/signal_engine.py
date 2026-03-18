@@ -197,6 +197,8 @@ class AssetSignalEngine:
         # Trade history
         self.trades: list = []
         self.prices: deque = deque(maxlen=500)
+        # Store (price, timestamp) pairs for per-return dt annualization
+        self._price_times: deque = deque(maxlen=500)
 
         # VWAP
         self.vwap_n: float = 0.0
@@ -333,6 +335,7 @@ class AssetSignalEngine:
         self.vwap_n += price * qty
         self.vwap_d += qty
         self.prices.append(price)
+        self._price_times.append((price, now))
         if self.ema5 is None:
             self.ema5 = self.ema20 = price
         else:
@@ -504,12 +507,44 @@ class AssetSignalEngine:
         return max(bull, 5 - bull)
 
     def get_realized_vol(self) -> float:
-        if len(self.prices) < 20:
+        """
+        Annualized realized volatility from irregular tick-level log returns.
+
+        Uses actual elapsed time between observations:
+            var_rate ≈ mean(r_t^2 / dt_t)
+            annualized_vol = sqrt(var_rate * SECONDS_PER_YEAR)
+        """
+        SECONDS_PER_YEAR = 365 * 24 * 3600
+        if len(self._price_times) < 20:
             return 0.3
-        prices = list(self.prices)[-60:]
-        rets = np.diff(np.log(prices))
-        # Annualised: 365 days × 96 15-min candles per day
-        return float(np.std(rets) * np.sqrt(365 * 96))
+
+        pts = list(self._price_times)[-120:]
+        prices = np.array([p for p, _ in pts], dtype=float)
+        times = np.array([t for _, t in pts], dtype=float)
+
+        if len(prices) < 2:
+            return 0.3
+
+        log_prices = np.log(prices)
+        rets = np.diff(log_prices)
+        dts = np.diff(times)
+
+        # Minimum dt floor of 1s to avoid bursts (10–50ms ticks) inflating annualized vol
+        valid = dts >= 1.0
+        if valid.sum() < 5:
+            return 0.3
+
+        rets = rets[valid]
+        dts = dts[valid]
+
+        var_rate = float(np.mean((rets ** 2) / dts))
+        ann_vol = math.sqrt(max(var_rate * SECONDS_PER_YEAR, 0.0))
+
+        if not np.isfinite(ann_vol):
+            return 0.3
+
+        log.debug(f"[{self.symbol.upper()}] realized_vol={ann_vol:.4f}")
+        return float(ann_vol)
 
     def get_components(self) -> dict:
         return {

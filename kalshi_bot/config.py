@@ -57,7 +57,7 @@ class TradingConfig:
     SHARPE_MIN_TRADES: int      = 20        # only apply Sharpe gate after this many trades
 
     # Volatility filter
-    VOL_HI: float               = 0.80      # annualised; above → no entry
+    VOL_HI: float               = 1.5       # annualised; above → no entry (crypto 15m commonly 100–200%+)
     VOL_MID: float               = 0.60     # above → half position
 
     # Structural model: floor vol to prevent exploding z when realized vol is tiny (early window)
