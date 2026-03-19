@@ -79,7 +79,10 @@ class KalshiMultiBot:
     def __init__(self):
         self.kalshi   = KalshiClient()
         self.sim      = SimState.load()
-        self.sim.save()  # ensure dashboard has valid file from startup
+        if self.sim.reconcile_from_trade_log():
+            self.sim.save()  # persist reconciled state
+        else:
+            self.sim.save()  # ensure dashboard has valid file from startup
         self.recorder = EventRecorder()
         self.engines: Dict[str, AssetEngine] = {}
 
@@ -266,9 +269,17 @@ class KalshiMultiBot:
                                 float(pl["p"]), float(pl["q"]), pl["m"]
                             )
                         elif "depth20" in stream:
-                            sig.update_book_binance(
-                                pl.get("bids", []), pl.get("asks", [])
-                            )
+                            bids, asks = pl.get("bids", []), pl.get("asks", [])
+                            sig.update_book_binance(bids, asks)
+                            # Update synthetic spot from Binance book
+                            if bids and asks:
+                                try:
+                                    best_bid = max(float(b[0]) for b in bids if len(b) >= 1 and float(b[0]) > 0)
+                                    best_ask = min(float(a[0]) for a in asks if len(a) >= 1 and float(a[0]) > 0)
+                                    if best_bid > 0 and best_ask > 0:
+                                        engine.synthetic_spot.update("binance", (best_bid + best_ask) / 2)
+                                except (ValueError, IndexError):
+                                    pass
             except Exception as e:
                 if "451" in str(e):
                     log.debug(f"[{spec.symbol}] Binance 451 (US block): {e} — retry in 5s")
@@ -436,6 +447,16 @@ class KalshiMultiBot:
             self.print_status()
             self.sim.save()
 
+    # ─── Venue warmup check ────────────────────────────────────────────────────
+
+    async def _warmup_check(self) -> None:
+        """After 60s, warn if any asset has fewer than 2 venues in synthetic_spot."""
+        await asyncio.sleep(60)
+        for asset, engine in self.engines.items():
+            count = engine.synthetic_spot.source_count
+            if count < 2:
+                log.warning(f"[{asset}] Only {count} venue(s) after 60s warmup")
+
     # ─── Run ──────────────────────────────────────────────────────────────────
 
     async def run(self) -> None:
@@ -460,6 +481,7 @@ class KalshiMultiBot:
 
         tasks.append(self.heartbeat())
         tasks.append(self.recorder.run())
+        tasks.append(self._warmup_check())
 
         await asyncio.gather(*tasks)
 

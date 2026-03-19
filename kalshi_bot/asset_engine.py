@@ -45,9 +45,12 @@ from .strategy.strategy_router import StrategyRouter
 from .strategy.lag_arb import LagArbStrategy
 from .strategy.close_boundary import CloseBoundaryStrategy
 from .strategy.dislocation_reversion import DislocationReversionStrategy
+from .recorder import rotate_log_if_needed, DECISIONS_MAX_LINES, DECISIONS_KEEP_LINES
 
 log = logging.getLogger("asset_engine")
-DECISION_LOG = "logs/kalshi_decisions.jsonl"
+# Absolute path so decisions write to project logs/ regardless of cwd
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DECISION_LOG = str(_PROJECT_ROOT / "logs" / "kalshi_decisions.jsonl")
 
 
 def _tf_log_fields(tf) -> dict:
@@ -113,6 +116,7 @@ class AssetEngine:
         self._ticker: str             = ""
         self._window_id: int          = -1
         self._window_start: Optional[float] = None
+        self._close_time_utc: Optional[str]  = None  # Kalshi ISO UTC e.g. "2026-03-18T12:30:00Z"
         self._price_to_beat: Optional[float] = None
 
         # Open position for this asset
@@ -131,6 +135,11 @@ class AssetEngine:
         self._wait_last_log: float = time.time()
         self._p_base_min: float = cfg.P_BASE_MIN
         self._p_base_max: float = cfg.P_BASE_MAX
+
+        # Cross-asset consistency: last p_base per window for divergence monitoring
+        self._last_p_base: Optional[float] = None
+        self._last_p_base_ts: float = 0.0
+        self._last_p_base_window_id: int = -1
 
     # ─── Strategy snapshot helpers ────────────────────────────────────────────
 
@@ -227,11 +236,13 @@ class AssetEngine:
         if m:
             self._market = m
             self._ticker = m.get("ticker", "")
+            self._close_time_utc = m.get("close_time")
             log.info(f"[{self.spec.symbol}] New window {_fmt_window(wid)} | ticker={self._ticker}")
         else:
             log.warning(f"[{self.spec.symbol}] No active market for {self.spec.series_ticker}")
             self._market = None
             self._ticker = ""
+            self._close_time_utc = None
 
         # Record price-to-beat: prefer synthetic_spot (robust), never use 0 or stale
         sm = self.synthetic_spot.spot_mid
@@ -258,9 +269,13 @@ class AssetEngine:
         if pos is None:
             return (0.0, 0.0, 0)
 
-        if self.signal.prices:
-            btc_exit = float(self.signal.prices[-1])
-        else:
+        # Use same source as price_to_beat: synthetic_spot first, else signal.prices
+        exit_spot = None
+        if self.synthetic_spot.spot_mid is not None and self.synthetic_spot.spot_mid > 0:
+            exit_spot = float(self.synthetic_spot.spot_mid)
+        elif self.signal.prices:
+            exit_spot = float(self.signal.prices[-1])
+        if exit_spot is None:
             log.warning(f"[{self.spec.symbol}] Cannot resolve: no exchange price.")
             self._open_pos = None
             return (0.0, 0.0, 0)
@@ -271,13 +286,17 @@ class AssetEngine:
             self._open_pos = None
             return (0.0, 0.0, 0)
 
-        went_up = btc_exit > ptb
-        won     = went_up if pos.side == "yes" else not went_up
+        # YES position: win when exit_spot > price_to_beat
+        # NO position:  win when exit_spot < price_to_beat
+        if pos.side == "yes":
+            won = exit_spot > ptb
+        else:
+            won = exit_spot < ptb
         exit_price = 1.0 if won else 0.0
 
         log.info(
             f"[{self.spec.symbol}] RESOLVE side={pos.side.upper()} | "
-            f"ptb={ptb:.4f} exit={btc_exit:.4f} {'UP' if went_up else 'DOWN'} | "
+            f"ptb={ptb:.4f} exit={exit_spot:.4f} {'UP' if exit_spot > ptb else 'DOWN'} | "
             f"{'WIN' if won else 'LOSS'}"
         )
         window_id_str = _fmt_window_id(pos.window_id)
@@ -289,11 +308,12 @@ class AssetEngine:
             contracts=pos.contracts,
             window_id=window_id_str,
             price_to_beat=ptb,
-            exit_spot=btc_exit,
+            exit_spot=exit_spot,
+            side=pos.side,
         )
         self._open_pos = None
         self.sim.save()
-        return (btc_exit, pnl, 1)
+        return (exit_spot, pnl, 1)
 
     # ─── Price update (called by Kalshi WS handler) ───────────────────────────
 
@@ -367,7 +387,9 @@ class AssetEngine:
         # Venue dislocation guard (protects against feed anomalies)
         if self.synthetic_spot.dislocation > 0.002:
             return self._wait("venue_dislocation", yes_price_raw)
-        if self.synthetic_spot.confidence < 0.3:
+        # Require >= 2 fresh venues (conf >= 0.6) — 1 venue = 0.3, 2 = 0.6
+        spot_conf = self.synthetic_spot.confidence
+        if spot_conf < 0.6:
             return self._wait("spot_confidence_low", yes_price_raw)
 
         # Volatility filter
@@ -425,38 +447,59 @@ class AssetEngine:
         )
 
         if tf.p_base is None:
-            d = self._wait("structural_prob_invalid", yes_price_raw)
+            d = self._wait("structural_prob_invalid", yes_price_raw, spot_now=spot_now, spot_start=spot_start)
             d.update(_tf_log_fields(tf))
             return d
 
-        # Diagnostic: tau, vol, z for debugging extreme z-scores (DEBUG to avoid log spam)
+        # Diagnostic: time_remaining, tau, vol, z for debugging (DEBUG to avoid log spam)
         tau = time_remaining / (365 * 24 * 3600)
         vol = self.signal.get_realized_vol()
         log.debug(
             f"[{self.spec.symbol}] spot_now={spot_now:.2f} spot_start={spot_start:.2f} "
-            f"tau={tau:.4f} vol={vol:.4f} z={tf.z_threshold:.4f}"
+            f"time_remaining={time_remaining:.1f} tau={tau:.4f} vol={vol:.4f} z={tf.z_threshold:.4f}"
         )
 
         p_base = tf.p_base
         if p_base < self._p_base_min or p_base > self._p_base_max:
-            log.warning(f"[{self.spec.symbol}] p_base={p_base} out of valid range [{self._p_base_min},{self._p_base_max}], skipping")
-            d = self._wait("structural_model_invalid", yes_price_raw)
+            log.debug(f"[{self.spec.symbol}] p_base={p_base} out of valid range [{self._p_base_min},{self._p_base_max}], skipping")
+            d = self._wait("structural_model_invalid", yes_price_raw, p_base=p_base, alpha_micro=0.0, spot_now=spot_now, spot_start=spot_start)
             d.update(_tf_log_fields(tf))
             return d
+
+        # Store for cross-asset divergence monitoring
+        self._last_p_base = p_base
+        self._last_p_base_ts = time.time()
+        self._last_p_base_window_id = self._window_id
+
+        # Cross-asset consistency: compare p_base across assets in same window
+        if self._all_engines:
+            now = time.time()
+            for other_sym, other_eng in self._all_engines.items():
+                if other_sym == self.spec.symbol:
+                    continue
+                if (other_eng._last_p_base is not None
+                        and other_eng._last_p_base_window_id == self._window_id
+                        and now - other_eng._last_p_base_ts < 30):
+                    delta = abs(p_base - other_eng._last_p_base)
+                    if delta >= 0.15:  # flag when p_base differs by 15+ percentage points
+                        log.info(
+                            f"Cross-asset divergence: {self.spec.symbol} p_base={p_base:.3f} "
+                            f"{other_sym} p_base={other_eng._last_p_base:.3f} delta={delta:.3f}"
+                        )
 
         # Staleness: skip near-50/50 when data feels unreliable
         if 0.495 <= yes_price_raw <= 0.505:
             if self._last_price_ts > 0:
                 age = time.time() - self._last_price_ts
                 if age > cfg.PRICE_MAX_AGE_SECS:
-                    return self._wait(f"price_stale_at_50({age:.0f}s)", yes_price_raw)
+                    return self._wait(f"price_stale_at_50({age:.0f}s)", yes_price_raw, spot_now=spot_now, spot_start=spot_start)
 
         # Skip near 50/50 only when lag and mispricing are both weak
         if (0.47 <= yes_price_raw <= 0.53
                 and self.lag_tracker.lag_confidence < 0.4
                 and (tf.confidence_weighted_mispricing is None
                      or abs(tf.confidence_weighted_mispricing) < 0.04)):
-            d = self._wait("uncertain_near_50", yes_price_raw)
+            d = self._wait("uncertain_near_50", yes_price_raw, p_base=p_base, alpha_micro=0.0, spot_now=spot_now, spot_start=spot_start)
             d.update(_tf_log_fields(tf))
             return d
 
@@ -486,6 +529,10 @@ class AssetEngine:
         # Blend: structural model anchors, microstructure adjusts
         p_real = sigmoid(logit(p_base_clamped) + alpha_micro)
 
+        # Block entry when p_real is stuck near 0.50 (no valid signal)
+        if 0.48 <= p_real <= 0.52:
+            return self._wait("p_real_near_50", yes_price_raw, p_base=p_base, alpha_micro=alpha_micro)
+
         # Portfolio cap: check before strategy (hard risk limit)
         if self._all_engines:
             all_positions = [
@@ -494,7 +541,7 @@ class AssetEngine:
             ]
             gross = self.sim.gross_open_exposure(all_positions)
             if gross + cfg.MAX_POS_PCT > 0.08:
-                return self._wait(f"portfolio_cap({gross:.1%})", yes_price_raw)
+                return self._wait(f"portfolio_cap({gross:.1%})", yes_price_raw, spot_now=spot_now, spot_start=spot_start)
 
         # Strategy router
         sm = self.synthetic_spot.spot_mid
@@ -519,19 +566,37 @@ class AssetEngine:
         }
         signal = self.router.route(snapshot)
         if signal.action == "WAIT":
-            d = self._wait(signal.reason, yes_price_raw)
-            d.update(_tf_log_fields(tf))
-            d["strategy"] = signal.strategy
-            d["diagnostics"] = signal.diagnostics
-            d["raw_features"] = raw_features
-            d["alpha_micro"] = alpha_micro
-            return d
-
-        action = signal.action
-        ev = signal.score if signal.score != 0 else (p_real - p_market)
+            # Secondary entry: alpha overlay can drive entries when CWM is low but p_real diverges
+            p_real_edge = abs(p_real - yes_price_raw)
+            lag_conf = self.lag_tracker.lag_confidence
+            if p_real_edge >= 0.12 and lag_conf >= 0.50:
+                # Allow trade via alpha-edge path (OR with CWM path)
+                action = "BUY_YES" if p_real > yes_price_raw else "BUY_NO"
+                ev = p_real - yes_price_raw
+                signal_strategy = "alpha_edge"
+            elif 0.08 <= p_real_edge < 0.12 and lag_conf >= 0.50:
+                d = self._wait("alpha_edge_insufficient", yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
+                d.update(_tf_log_fields(tf))
+                d["strategy"] = signal.strategy
+                d["diagnostics"] = signal.diagnostics
+                d["raw_features"] = raw_features
+                d["alpha_micro"] = alpha_micro
+                return d
+            else:
+                d = self._wait(signal.reason, yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
+                d.update(_tf_log_fields(tf))
+                d["strategy"] = signal.strategy
+                d["diagnostics"] = signal.diagnostics
+                d["raw_features"] = raw_features
+                d["alpha_micro"] = alpha_micro
+                return d
+        else:
+            action = signal.action
+            ev = signal.score if signal.score != 0 else (p_real - p_market)
+            signal_strategy = signal.strategy
 
         if abs(ev) < min_edge:
-            return self._wait(f"edge({ev:+.3f}<{min_edge:.3f})", yes_price_raw)
+            return self._wait(f"edge({ev:+.3f}<{min_edge:.3f})", yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
 
         conv = self.signal.conviction()
         if conv < cfg.MIN_CONVICTION:
@@ -540,13 +605,13 @@ class AssetEngine:
         # Lag gate: require detectable Kalshi lag behind Binance
         lag_conf = self.lag_tracker.lag_confidence
         if lag_conf < 0.15:
-            return self._wait(f"lag_absent({lag_conf:.2f})", yes_price_raw)
+            return self._wait(f"lag_absent({lag_conf:.2f})", yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
 
         # Sharpe gate (after enough trades to be meaningful)
         if (self.sim.total_trades >= cfg.SHARPE_MIN_TRADES
                 and len(self.sim.returns_hist) >= 10):
             if self.sim.current_sharpe < cfg.SHARPE_MIN:
-                return self._wait(f"sharpe({self.sim.current_sharpe:.2f}<{cfg.SHARPE_MIN})", yes_price_raw)
+                return self._wait(f"sharpe({self.sim.current_sharpe:.2f}<{cfg.SHARPE_MIN})", yes_price_raw, spot_now=spot_now, spot_start=spot_start)
 
         # Kelly sizing
         if ev > 0:
@@ -562,10 +627,10 @@ class AssetEngine:
 
         ok, reason = self.sim.can_trade(size_usd, abs(ev), min_edge)
         if not ok:
-            return self._wait(reason, yes_price_raw)
+            return self._wait(reason, yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
 
         if size_usd < cfg.MIN_TRADE_USD:
-            return self._wait(f"size_too_small(${size_usd:.2f})", yes_price_raw)
+            return self._wait(f"size_too_small(${size_usd:.2f})", yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
 
         log.warning(f"[{self.spec.symbol}] Pre-trade p_base={p_base:.4f} p_real={p_real:.4f}")
         return {
@@ -577,7 +642,7 @@ class AssetEngine:
             "p_base":        p_base,
             "spot_now":      spot_now,
             "spot_start":    spot_start,
-            "strategy":      signal.strategy,
+            "strategy":      signal_strategy,
             "diagnostics":   signal.diagnostics,
             "raw_features":  raw_features,
             "alpha_micro":   alpha_micro,
@@ -597,8 +662,20 @@ class AssetEngine:
     # ─── Execution ────────────────────────────────────────────────────────────
 
     def _execute(self, d: dict, yes_price: float) -> None:
+        spot_conf = d.get("spot_confidence")
+        if spot_conf is not None and spot_conf < 0.6:
+            log.warning(f"[{self.spec.symbol}] Aborting order: spot_confidence={spot_conf:.2f} < 0.6 (feed unreliable)")
+            return
+        p_real = d.get("p_real")
+        if p_real is not None and 0.48 <= p_real <= 0.52:
+            log.warning(f"[{self.spec.symbol}] Aborting order: p_real={p_real:.4f} in [0.48,0.52] (no valid signal)")
+            return
+
         side         = "yes" if d["action"] == "BUY_YES" else "no"
         entry_price  = yes_price if side == "yes" else (1.0 - yes_price)
+        if entry_price < self._p_base_min:
+            log.warning(f"[{self.spec.symbol}] Rejecting entry: price={entry_price:.4f} < {self._p_base_min} (min)")
+            return
         # Kalshi: each contract costs entry_price dollars; you receive $1 on win.
         # contracts = floor(size_usd / entry_price)
         contracts = max(1, int(d["size_usd"] / max(entry_price, 0.01)))
@@ -610,16 +687,7 @@ class AssetEngine:
             f"×{contracts} contracts (${d['size_usd']:.2f})"
         )
 
-        ok = self.kalshi.place_market_order(
-            ticker=self._ticker,
-            side=side,
-            count=contracts,
-        )
-        if not ok:
-            log.warning(f"[{self.spec.symbol}] Order failed — position NOT recorded.")
-            return
-
-        self._open_pos = OpenPosition(
+        pos = OpenPosition(
             window_id     = self._window_id,
             market_ticker = self._ticker,
             asset         = self.spec.symbol,
@@ -630,6 +698,17 @@ class AssetEngine:
             entered_at    = time.time(),
             price_to_beat = self._price_to_beat,
         )
+        self._open_pos = pos  # Set BEFORE order to prevent duplicate orders on rapid ticks
+        ok = self.kalshi.place_market_order(
+            ticker=self._ticker,
+            side=side,
+            count=contracts,
+        )
+        if not ok:
+            log.warning(f"[{self.spec.symbol}] Order failed — position NOT recorded.")
+            self._open_pos = None
+            return
+
         log.info(
             f"[{self.spec.symbol}] Position open | side={side.upper()} "
             f"entry={entry_price:.4f} ×{contracts} | ptb={self._price_to_beat}"
@@ -656,7 +735,15 @@ class AssetEngine:
 
     # ─── WAIT helper ─────────────────────────────────────────────────────────
 
-    def _wait(self, reason: str, yes_price: float) -> dict:
+    def _wait(
+        self,
+        reason: str,
+        yes_price: float,
+        p_base: Optional[float] = None,
+        alpha_micro: Optional[float] = None,
+        spot_now: Optional[float] = None,
+        spot_start: Optional[float] = None,
+    ) -> dict:
         bucket = reason.split("(")[0].split("<")[0]
         self._wait_counts[bucket] = self._wait_counts.get(bucket, 0) + 1
         now = time.time()
@@ -671,15 +758,24 @@ class AssetEngine:
             (self.signal.prices[-1] - self._price_to_beat)
             if self.signal.prices and self._price_to_beat is not None else 0.0
         )
-        return {
+        if p_base is not None and alpha_micro is not None:
+            p_real = sigmoid(logit(max(0.001, min(0.999, p_base))) + alpha_micro)
+        else:
+            p_real = None
+        out = {
             "action": "WAIT", "size_usd": 0, "ev": 0,
-            "p_real": 0.5, "p_market": yes_price,
+            "p_real": p_real, "p_market": yes_price,
             "conviction": 0, "reason": reason,
             "time_remaining": time_remaining,
             "dist_from_threshold": dist_from_threshold,
             "lag_signal": self.lag_tracker.lag_signal,
             "lag_confidence": self.lag_tracker.lag_confidence,
         }
+        if spot_now is not None:
+            out["spot_now"] = spot_now
+        if spot_start is not None:
+            out["spot_start"] = spot_start
+        return out
 
     # ─── Diagnostics ───────────────────────────────────────────────────────────
 
@@ -729,12 +825,13 @@ class AssetEngine:
                 "signals":      self.signal.get_components(),
             }
             Path(DECISION_LOG).parent.mkdir(parents=True, exist_ok=True)
+            rotate_log_if_needed(DECISION_LOG, DECISIONS_MAX_LINES, DECISIONS_KEEP_LINES)
             with open(DECISION_LOG, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec) + "\n")
             if self.recorder:
                 self.recorder.record({"_type": "feature", **rec})
         except Exception as e:
-            log.debug(f"Decision log error: {e}")
+            log.warning(f"Decision log write failed: {e}")
 
     def print_status(self) -> None:
         pos_str = "none"

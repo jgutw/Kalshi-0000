@@ -183,6 +183,7 @@ class SimState:
         window_id: str = "",
         price_to_beat: Optional[float] = None,
         exit_spot: Optional[float] = None,
+        side: Optional[str] = None,
     ) -> float:
         """Record a closed trade. Returns P&L."""
         # Kalshi: each contract costs entry_price cents, pays $1 on win.
@@ -200,12 +201,15 @@ class SimState:
             "window_id": window_id,
             "price_to_beat": price_to_beat,
             "exit_spot": exit_spot,
+            "side":     side,
         }
         self.trades.append(trade)
         self.total_trades += 1
         self.balance += pnl
 
-        if pnl > 0:
+        # Binary: exit 1.0 = win, exit 0.0 = loss (explicit check; pnl can have float quirks)
+        won = exit_ >= 0.5
+        if won:
             self.wins        += 1
             self.consec_losses = 0
             self._halted_at   = None   # clear cooldown timer on win
@@ -238,7 +242,7 @@ class SimState:
         self._update_risk()
 
         pnl_str = f"+{pnl:.2f}" if pnl >= 0 else f"{pnl:.2f}"
-        log.info(f"{'WIN' if pnl >= 0 else 'LOSS'} [{asset}] PnL=${pnl_str}  "
+        log.info(f"{'WIN' if won else 'LOSS'} [{asset}] PnL=${pnl_str}  "
                  f"Balance=${self.balance:.2f}  WR={self.win_rate:.1%}  "
                  f"Streak={self.consec_losses}")
 
@@ -252,6 +256,8 @@ class SimState:
                 out.pop("price_to_beat", None)
             if out.get("exit_spot") is None:
                 out.pop("exit_spot", None)
+            if out.get("side") is None:
+                out.pop("side", None)
             with open(TRADE_LOG, "a", encoding="utf-8") as f:
                 f.write(json.dumps(out) + "\n")
         except OSError:
@@ -309,7 +315,7 @@ class SimState:
     def load(cls, path: str = None) -> "SimState":
         path = path or cfg.SIM_FILE
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(path, encoding="utf-8-sig") as f:
                 d = json.load(f)
             s = cls()
             s.balance          = d.get("balance",          cfg.SIM_BALANCE)
@@ -336,3 +342,77 @@ class SimState:
             s = cls()
             s.daily_start_ts = time.time()
             return s
+
+    def reconcile_from_trade_log(self, trade_log_path: str | Path = None) -> bool:
+        """
+        If kalshi_trades.jsonl has more records than total_trades, rebuild sim state
+        from the trade log. Reconciles after bot restart when trades were written
+        but sim wasn't saved (e.g. crash, or loaded stale backup).
+        Returns True if reconciliation was performed.
+        """
+        path = Path(trade_log_path or TRADE_LOG)
+        if not path.exists():
+            return False
+        trades = []
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        trades.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            return False
+        old_total = self.total_trades
+        if len(trades) <= old_total:
+            return False
+        # Rebuild from trade log
+        start = self.starting_balance
+        wins = sum(1 for t in trades if float(t.get("pnl", 0)) > 0)
+        losses = len(trades) - wins
+        total_pnl = sum(float(t.get("pnl", 0)) for t in trades)
+        self.total_trades = len(trades)
+        self.wins = wins
+        self.losses = losses
+        self.balance = start + total_pnl
+        self.peak_balance = max(self.peak_balance, self.balance)
+        # Per-asset stats
+        by_asset = {}
+        for t in trades:
+            a = t.get("asset", "?")
+            if a not in by_asset:
+                by_asset[a] = AssetStats(a)
+            pnl = float(t.get("pnl", 0))
+            if pnl > 0:
+                by_asset[a].wins += 1
+            else:
+                by_asset[a].losses += 1
+            by_asset[a].total_pnl += pnl
+        self.asset_stats = by_asset
+        # Returns history for risk metrics
+        self.returns_hist = []
+        for t in trades:
+            ref = float(t.get("entry", 0)) * int(t.get("contracts", 0))
+            pnl = float(t.get("pnl", 0))
+            if ref > 0:
+                self.returns_hist.append(pnl / ref)
+        self._update_risk()
+        # Consec losses from tail
+        self.consec_losses = 0
+        for t in reversed(trades):
+            if float(t.get("pnl", 0)) > 0:
+                break
+            self.consec_losses += 1
+        if self.consec_losses >= cfg.MAX_CONSEC_LOSSES:
+            self._halted_at = time.time()
+        else:
+            self._halted_at = None
+        self.trades = trades[-100:]
+        log.warning(
+            f"SimState reconciled from trade log: {len(trades)} trades "
+            f"(sim had {old_total})"
+        )
+        return True

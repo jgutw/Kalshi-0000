@@ -2,7 +2,7 @@
 synthetic_spot.py — Multi-venue synthetic spot estimator with freshness.
 
 Tracks venue prices with timestamps. spot_mid and dislocation use only
-venues updated within the last 5 seconds.
+venues updated within the last 15 seconds (matches 15-min binary horizon).
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import time
 from typing import Dict, Optional
 
 log = logging.getLogger("kalshi_bot.synthetic_spot")
-FRESHNESS_SECS = 5.0
+FRESHNESS_SECS = 15.0
 
 # source_count -> confidence
 CONFIDENCE_MAP = {
@@ -27,7 +27,7 @@ CONFIDENCE_MAP = {
 class SyntheticSpotEstimator:
     """
     Robust composite spot price across venues with freshness tracking.
-    Uses median of fresh venues. Allows 1 venue if fresh (< 5s); else requires >= 2.
+    Uses median of fresh venues. Allows 1 venue if fresh (< 15s); else requires >= 2.
     """
 
     def __init__(self, symbol: str = ""):
@@ -40,6 +40,8 @@ class SyntheticSpotEstimator:
         """Add or refresh a venue price. ts defaults to time.time()."""
         if ts is None:
             ts = time.time()
+        if price > 0:
+            log.debug(f"[{self._symbol}] spot update: source={source} price={price}")
         self._venues[source] = (price, ts)
         fresh = self._fresh_venues()
         fresh_count = len(fresh)
@@ -58,8 +60,8 @@ class SyntheticSpotEstimator:
 
     @property
     def spot_mid(self) -> Optional[float]:
-        """Median of venue prices updated within the last 5 seconds.
-        Allows 1 venue if fresh (< 5s old); otherwise requires >= 2 venues."""
+        """Median of venue prices updated within the last 15 seconds.
+        Allows 1 venue if fresh (< 15s old); otherwise requires >= 2 venues."""
         fresh = self._fresh_venues()
         vals = []
         for venue, (price, _) in fresh.items():
@@ -87,7 +89,7 @@ class SyntheticSpotEstimator:
 
     @property
     def source_count(self) -> int:
-        """Number of venues with a fresh price (updated within last 5 seconds)."""
+        """Number of venues with a fresh price (updated within last 15 seconds)."""
         return len(self._fresh_venues())
 
     @property
