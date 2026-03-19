@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict
 
+from ..config import cfg
+
 
 @dataclass
 class StrategySignal:
@@ -58,7 +60,7 @@ class LagArbStrategy:
 
         if lag_confidence < 0.15:
             return StrategySignal("lag_arb", 0.0, "WAIT", "lag_absent", self.diagnostics)
-        if lag_confidence < 0.30:
+        if lag_confidence < cfg.LAG_CONFIDENCE_MIN:
             return StrategySignal("lag_arb", 0.0, "WAIT", "lag_confidence_low", self.diagnostics)
         if kalshi_quote_age >= 20:
             return StrategySignal("lag_arb", 0.0, "WAIT", "kalshi_quote_stale", self.diagnostics)

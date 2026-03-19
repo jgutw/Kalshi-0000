@@ -40,8 +40,8 @@ ASSETS: List[AssetSpec] = [
 @dataclass
 class TradingConfig:
     # Kelly / position sizing
-    KELLY_FRACTION: float       = 0.25      # quarter-Kelly
-    MIN_EDGE_PCT: float         = 0.05      # minimum |p_real - p_market| to enter
+    KELLY_FRACTION: float       = 0.35      # was 0.25; quarter-Kelly → modest increase
+    MIN_EDGE_PCT: float         = 0.03      # was 0.05; base floor, adaptive term adds during uncertainty
     MAX_POS_PCT: float          = 0.03      # 3% of bankroll per trade
     MIN_TRADE_USD: float        = 5.0
 
@@ -52,6 +52,7 @@ class TradingConfig:
     DAILY_RESET_HOUR_UTC: int   = 0         # reset daily_start balance at midnight UTC
 
     # Signal quality gates
+    LAG_CONFIDENCE_MIN: float   = 0.25     # lag_confidence_low threshold; below this → WAIT
     MIN_CONVICTION: int         = 3         # of 5 signals must agree
     SHARPE_MIN: float           = 1.2       # min Sharpe over last N trades
     SHARPE_MIN_TRADES: int      = 20        # only apply Sharpe gate after this many trades
