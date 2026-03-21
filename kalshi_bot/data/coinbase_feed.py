@@ -175,7 +175,18 @@ async def run_coinbase_microstructure(
                 }))
                 book_bids: Dict[str, float] = {}
                 book_asks: Dict[str, float] = {}
+                msg_count = 0
+
+                async def _30s_check() -> None:
+                    await asyncio.sleep(30)
+                    log.info(f"[{symbol}] Coinbase 30s check: {msg_count} messages received")
+                    if msg_count == 0:
+                        log.warning(f"[{symbol}] No messages in 30s — forcing reconnect")
+                        await ws.close()
+
+                asyncio.create_task(_30s_check())
                 async for raw in ws:
+                    msg_count += 1
                     try:
                         data = json.loads(raw)
                     except json.JSONDecodeError:

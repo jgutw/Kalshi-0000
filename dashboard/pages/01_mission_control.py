@@ -135,8 +135,8 @@ for i, asset in enumerate(assets):
         st.markdown("**PROBABILITY STACK**")
         p_m = s.p_market or 0
         p_b = s.p_base or 0
-        p_r = s.p_real or 0
-        st.markdown(f"p_market: {p_m:.3f} | p_base: {p_b:.3f} | p_real: {p_r:.3f}")
+        p_r_str = f"{s.p_real:.3f}" if s.p_real is not None else "—"
+        st.markdown(f"p_market: {p_m:.3f} | p_base: {p_b:.3f} | p_real: {p_r_str}")
         cwm = s.confidence_weighted_mispricing or 0
         if cwm > 0.04:
             st.markdown(f'<span style="color:#00c864">CWM: {cwm:+.4f}</span>', unsafe_allow_html=True)

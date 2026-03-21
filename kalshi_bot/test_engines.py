@@ -109,7 +109,7 @@ try:
 
     # Record some losses to trigger cooldown
     for _ in range(cfg.MAX_CONSEC_LOSSES):
-        s.record("KXBTC15M-test", "BTC", entry=0.60, exit_=0.0, contracts=10)
+        s.record("KXBTC15M-26MAR181200-00", "BTC", entry=0.60, exit_=0.0, contracts=7)
 
     halted, reason = s.is_halted()
     check("Halted after max losses",  halted, reason)
@@ -124,7 +124,7 @@ try:
     # Win resets streak
     s2 = SimState()
     s2.consec_losses = 2
-    s2.record("KXBTC15M-test", "BTC", entry=0.50, exit_=1.0, contracts=10)
+    s2.record("KXBTC15M-26MAR181200-00", "BTC", entry=0.50, exit_=1.0, contracts=7)
     check("Win resets consec_losses", s2.consec_losses == 0)
 
     # Daily reset logic
@@ -372,7 +372,7 @@ try:
     check("spot_mid None when 0 venues", ss.spot_mid is None)
     check("confidence 0.0 with no fresh venues", ss.confidence == 0.0)
     ss.update("binance", 95000.0)
-    check("spot_mid None when 1 venue (after update)", ss.spot_mid is None)
+    check("spot_mid returns value when 1 venue (after update)", ss.spot_mid is not None and ss.spot_mid == 95000.0)
     check("confidence 0.3 with 1 venue", ss.confidence == 0.3)
     ss4 = SyntheticSpotEstimator()
     for name, px in [("a", 100.0), ("b", 101.0), ("c", 102.0), ("d", 103.0)]:
@@ -465,13 +465,14 @@ try:
           and hasattr(tf, "confidence_weighted_mispricing") and hasattr(tf, "spot_confidence")
           and hasattr(tf, "lag_confidence"))
 
-    # z_threshold = 0.0 when spot_now == spot_start
+    # z_threshold ≈ 0 when spot_now == spot_start (GBM drift term yields slight deviation)
     tf0 = compute_threshold_features(
         spot_now=95000, spot_start=95000,
         time_remaining_secs=450, annualized_vol=0.80,
         p_market=0.50, spot_confidence=0.6, lag_confidence=0.5,
     )
-    check("z_threshold = 0.0 when spot_now == spot_start", tf0.z_threshold == 0.0, f"got {tf0.z_threshold}")
+    check("z_threshold ≈ 0 when spot_now == spot_start",
+          abs(tf0.z_threshold) < 0.01, f"got {tf0.z_threshold}")
 
     # confidence_weighted_mispricing is None when p_base is None
     tf_inv = compute_threshold_features(

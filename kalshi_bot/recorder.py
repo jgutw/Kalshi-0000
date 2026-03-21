@@ -9,6 +9,28 @@ import json
 import time
 from pathlib import Path
 
+# Log rotation: truncate when over limit, keep last N lines
+DECISIONS_MAX_LINES = 20_000
+DECISIONS_KEEP_LINES = 10_000
+FEATURES_MAX_LINES = 20_000
+FEATURES_KEEP_LINES = 10_000
+EVENTS_MAX_LINES = 5_000
+EVENTS_KEEP_LINES = 5_000
+
+
+def rotate_log_if_needed(path: str | Path, max_lines: int, keep_lines: int) -> None:
+    """If file exceeds max_lines, truncate to last keep_lines."""
+    p = Path(path)
+    try:
+        if p.exists():
+            with open(p, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) > max_lines:
+                with open(p, "w", encoding="utf-8") as f:
+                    f.writelines(lines[-keep_lines:])
+    except OSError:
+        pass
+
 
 class EventRecorder:
     """
@@ -53,6 +75,8 @@ class EventRecorder:
                     path = self.FEATURE_LOG if e.get("_type") == "feature" else self.EVENT_LOG
                     try:
                         Path(path).parent.mkdir(parents=True, exist_ok=True)
+                        max_ln, keep_ln = (FEATURES_MAX_LINES, FEATURES_KEEP_LINES) if e.get("_type") == "feature" else (EVENTS_MAX_LINES, EVENTS_KEEP_LINES)
+                        rotate_log_if_needed(path, max_ln, keep_ln)
                         with open(path, "a", encoding="utf-8") as f:
                             f.write(json.dumps(e) + "\n")
                     except OSError:

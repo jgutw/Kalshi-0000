@@ -39,7 +39,7 @@ def render_probability_stack_chart(
     ts_vals = [e.ts for e in events]
     p_market = [e.p_market if e.p_market is not None else 0.5 for e in events]
     p_base = [e.p_base if e.p_base is not None else 0.5 for e in events]
-    p_real = [e.p_real if e.p_real is not None else 0.5 for e in events]
+    p_real = [e.p_real if e.p_real is not None else None for e in events]
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=ts_vals, y=p_market, name="p_market", line=dict(color="#4a90d9", width=2)))

@@ -7,14 +7,13 @@ from spot levels, volatility, and market price.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Optional
 
+from scipy.stats import norm
+
 from kalshi_bot.config import cfg
 from kalshi_bot.prob_model import structural_prob
-
-SECONDS_PER_YEAR = 365 * 24 * 3600
 
 
 @dataclass
@@ -45,7 +44,6 @@ def compute_threshold_features(
     # Floor vol to prevent exploding z when realized vol is tiny (early window, few trades)
     vol_structural = max(annualized_vol, cfg.MIN_STRUCTURAL_VOL)
 
-    z_threshold = 0.0
     p_base = structural_prob(
         spot_now=spot_now,
         spot_start=spot_start,
@@ -53,26 +51,15 @@ def compute_threshold_features(
         annualized_vol=vol_structural,
     )
 
-    # Compute z_threshold (use floored vol to match structural_prob)
-    try:
-        if (spot_now <= 0 or spot_start <= 0 or annualized_vol < 0
-                or time_remaining_secs < 0):
-            z_threshold = 0.0
-        else:
-            tau = time_remaining_secs / SECONDS_PER_YEAR
-            sigma_tau = vol_structural * math.sqrt(tau)
-            if sigma_tau < 1e-12:
-                z_threshold = 0.0
-            else:
-                log_dist = math.log(spot_now / spot_start)
-                if abs(log_dist) < 1e-15:  # spot_now == spot_start
-                    z_threshold = 0.0
-                else:
-                    z_threshold = (
-                        log_dist - 0.5 * vol_structural ** 2 * tau
-                    ) / sigma_tau
-    except (ValueError, ZeroDivisionError):
+    # Derive z_threshold from p_base via inverse normal CDF; preserve deterministic direction
+    if p_base is None:
         z_threshold = 0.0
+    elif p_base <= 0.0:
+        z_threshold = float("-inf")
+    elif p_base >= 1.0:
+        z_threshold = float("inf")
+    else:
+        z_threshold = float(norm.ppf(p_base))
 
     mispricing_base = (p_base - p_market) if p_base is not None else None
     confidence_weighted_mispricing = (
