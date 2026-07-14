@@ -46,6 +46,7 @@ from .asset_engine import AssetEngine
 from .recorder import EventRecorder
 from .data.coinbase_feed import run_coinbase_microstructure as run_coinbase_microstructure_feed
 from .data.kraken_feed import run_kraken as run_kraken_feed
+from .session_meta import write_session_meta, tag_archived_session, prepare_fresh_round
 
 # Windows UTF-8 fix
 if sys.platform == "win32":
@@ -521,7 +522,18 @@ def main() -> None:
     parser.add_argument("--kelly",     type=float,          help="Override Kelly fraction")
     parser.add_argument("--min-edge",  type=float,          help="Override min edge")
     parser.add_argument("--no-xrp",   action="store_true",  help="Disable XRP engine")
+    parser.add_argument("--enable-xrp", action="store_true", help="Re-enable XRP (off by default)")
     parser.add_argument("--debug",    action="store_true",  help="Enable DEBUG logging (orderbook, etc.)")
+    parser.add_argument(
+        "--session-tag",
+        default="round_7_lower_size",
+        help="Label for logs/session_meta.json (run mode only)",
+    )
+    parser.add_argument(
+        "--fresh-round",
+        action="store_true",
+        help="Archive logs/ to sessions/, reset sim to $1000, then start",
+    )
     args = parser.parse_args()
 
     if args.debug:
@@ -538,6 +550,15 @@ def main() -> None:
         for spec in ASSETS:
             if spec.symbol == "XRP":
                 spec.enabled = False
+    if args.enable_xrp:
+        for spec in ASSETS:
+            if spec.symbol == "XRP":
+                spec.enabled = True
+
+    if args.fresh_round and args.mode == "run":
+        archive_tag = args.session_tag.replace("round_", "archive_", 1)
+        archived = prepare_fresh_round(archive_tag)
+        log.info("Starting fresh round after archive → %s", archived)
 
     bot = KalshiMultiBot()
 
@@ -546,6 +567,7 @@ def main() -> None:
     elif args.mode == "scan":
         bot.scan()
     else:
+        write_session_meta(session_tag=args.session_tag)
         try:
             asyncio.run(bot.run())
         except KeyboardInterrupt:

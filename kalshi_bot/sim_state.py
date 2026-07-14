@@ -88,10 +88,10 @@ class SimState:
     cvar_95:       float  = 0.0
     vol_regime:    str    = "normal"
 
-    # Circuit breaker cooldown
-    # When consec_losses >= MAX_CONSEC_LOSSES, record the halt timestamp.
-    # is_halted() returns True until now > _halted_at + COOLDOWN_MINUTES * 60.
+    # Circuit breaker cooldown (global legacy + per-asset when enabled)
     _halted_at:    Optional[float] = field(default=None, repr=False)
+    consec_losses_by_asset: dict = field(default_factory=dict)
+    _halted_at_by_asset: dict = field(default_factory=dict)
 
     # Per-asset stats
     asset_stats:   dict  = field(default_factory=dict)   # symbol → AssetStats
@@ -123,17 +123,36 @@ class SimState:
 
     # ─── Circuit breaker ──────────────────────────────────────────────────────
 
-    def is_halted(self) -> Tuple[bool, str]:
+    def is_halted(self, asset: Optional[str] = None) -> Tuple[bool, str]:
         """
         Returns (halted: bool, reason: str).
         Consecutive-loss halt auto-lifts after COOLDOWN_MINUTES.
         Daily-loss halt lifts at next UTC midnight (via _maybe_reset_daily).
+        When PER_ASSET_CIRCUIT_BREAKER and asset is set, only that asset's streak applies.
         """
-        # Daily loss check
+        self._maybe_reset_daily()
         if self.daily_dd >= cfg.MAX_DAILY_LOSS_PCT:
             return True, f"daily_loss {self.daily_dd:.1%}"
 
-        # Consecutive loss check with cooldown
+        if cfg.PER_ASSET_CIRCUIT_BREAKER and asset:
+            streak = int(self.consec_losses_by_asset.get(asset, 0))
+            halted_at = self._halted_at_by_asset.get(asset)
+            if streak >= cfg.MAX_CONSEC_LOSSES:
+                if halted_at is None:
+                    self._halted_at_by_asset[asset] = time.time()
+                    halted_at = self._halted_at_by_asset[asset]
+                elapsed = time.time() - halted_at
+                cooldown = cfg.COOLDOWN_MINUTES * 60
+                if elapsed < cooldown:
+                    remaining_min = (cooldown - elapsed) / 60
+                    return True, f"consec_loss_cooldown({remaining_min:.0f}m left)"
+                log.info(
+                    f"Circuit breaker [{asset}] cooldown expired after {elapsed/60:.0f}m — resuming"
+                )
+                self.consec_losses_by_asset[asset] = 0
+                self._halted_at_by_asset.pop(asset, None)
+            return False, ""
+
         if self.consec_losses >= cfg.MAX_CONSEC_LOSSES:
             if self._halted_at is None:
                 self._halted_at = time.time()
@@ -142,11 +161,9 @@ class SimState:
             if elapsed < cooldown:
                 remaining_min = (cooldown - elapsed) / 60
                 return True, f"consec_loss_cooldown({remaining_min:.0f}m left)"
-            else:
-                # Cooldown expired — reset and resume
-                log.info(f"Circuit breaker cooldown expired after {elapsed/60:.0f}m — resuming")
-                self.consec_losses = 0
-                self._halted_at = None
+            log.info(f"Circuit breaker cooldown expired after {elapsed/60:.0f}m — resuming")
+            self.consec_losses = 0
+            self._halted_at = None
 
         return False, ""
 
@@ -161,9 +178,8 @@ class SimState:
 
     # ─── Trade recording ──────────────────────────────────────────────────────
 
-    def can_trade(self, size_usd: float, edge: float, min_edge: float) -> Tuple[bool, str]:
-        self._maybe_reset_daily()
-        halted, reason = self.is_halted()
+    def can_trade(self, size_usd: float, edge: float, min_edge: float, asset: Optional[str] = None) -> Tuple[bool, str]:
+        halted, reason = self.is_halted(asset)
         if halted:
             return False, reason
         if edge < min_edge:
@@ -212,14 +228,30 @@ class SimState:
         if won:
             self.wins        += 1
             self.consec_losses = 0
-            self._halted_at   = None   # clear cooldown timer on win
+            self._halted_at   = None
+            self.consec_losses_by_asset[asset] = 0
+            self._halted_at_by_asset.pop(asset, None)
         else:
             self.losses        += 1
             self.consec_losses += 1
+            asset_streak = int(self.consec_losses_by_asset.get(asset, 0)) + 1
+            self.consec_losses_by_asset[asset] = asset_streak
             if self.consec_losses >= cfg.MAX_CONSEC_LOSSES and self._halted_at is None:
                 self._halted_at = time.time()
-                log.warning(f"Circuit breaker: {self.consec_losses} consecutive losses — "
-                            f"cooldown {cfg.COOLDOWN_MINUTES:.0f}m")
+                log.warning(
+                    f"Circuit breaker: {self.consec_losses} consecutive losses — "
+                    f"cooldown {cfg.COOLDOWN_MINUTES:.0f}m"
+                )
+            if (
+                cfg.PER_ASSET_CIRCUIT_BREAKER
+                and asset_streak >= cfg.MAX_CONSEC_LOSSES
+                and asset not in self._halted_at_by_asset
+            ):
+                self._halted_at_by_asset[asset] = time.time()
+                log.warning(
+                    f"Circuit breaker [{asset}]: {asset_streak} consecutive losses — "
+                    f"cooldown {cfg.COOLDOWN_MINUTES:.0f}m"
+                )
 
         ref = entry * contracts
         if ref > 0:
@@ -301,6 +333,8 @@ class SimState:
                     "losses":           self.losses,
                     "consec_losses":    self.consec_losses,
                     "_halted_at":       self._halted_at,
+                    "consec_losses_by_asset": self.consec_losses_by_asset,
+                    "_halted_at_by_asset": self._halted_at_by_asset,
                     "var_95":           self.var_95,
                     "cvar_95":          self.cvar_95,
                     "vol_regime":       self.vol_regime,
@@ -328,6 +362,8 @@ class SimState:
             s.losses           = d.get("losses",           0)
             s.consec_losses    = d.get("consec_losses",    0)
             s._halted_at       = d.get("_halted_at")
+            s.consec_losses_by_asset = d.get("consec_losses_by_asset", {})
+            s._halted_at_by_asset = d.get("_halted_at_by_asset", {})
             s.var_95           = d.get("var_95",           0.0)
             s.cvar_95          = d.get("cvar_95",          0.0)
             s.vol_regime       = d.get("vol_regime",       "normal")

@@ -31,7 +31,8 @@ ASSETS: List[AssetSpec] = [
     AssetSpec("BTC", "KXBTC15M", "btcusdt",  "BTC-USDT",  enabled=True),
     AssetSpec("ETH", "KXETH15M", "ethusdt",  "ETH-USDT",  enabled=True),
     AssetSpec("SOL", "KXSOL15M", "solusdt",  "SOL-USDT",  enabled=True),
-    AssetSpec("XRP", "KXXRP15M", "xrpusdt",  "XRP-USDT",  enabled=True),  # set False if unavailable
+    # Disabled after R2/R3 (0–17% WR, net drag). Pass --enable-xrp to trade it again.
+    AssetSpec("XRP", "KXXRP15M", "xrpusdt",  "XRP-USDT",  enabled=False),
 ]
 
 
@@ -39,27 +40,44 @@ ASSETS: List[AssetSpec] = [
 
 @dataclass
 class TradingConfig:
-    # Kelly / position sizing
-    KELLY_FRACTION: float       = 0.35      # was 0.25; quarter-Kelly → modest increase
-    MIN_EDGE_PCT: float         = 0.03      # was 0.05; base floor, adaptive term adds during uncertainty
-    MAX_POS_PCT: float          = 0.03      # 3% of bankroll per trade
+    # Active profile label (written to logs/session_meta.json)
+    CONFIG_PROFILE: str         = "lower_size_more_entries"
+
+    # Kelly / position sizing — smaller, more frequent bets
+    KELLY_FRACTION: float       = 0.20
+    MIN_EDGE_PCT: float         = 0.025     # keep; market orders need edge cushion
+    MAX_POS_PCT: float          = 0.02      # 2% of bankroll per trade
     MIN_TRADE_USD: float        = 5.0
 
-    # Circuit breaker — with cooldown (fixes halt-forever bug)
-    MAX_CONSEC_LOSSES: int      = 3
-    COOLDOWN_MINUTES: float     = 60.0      # resume after this many minutes
-    MAX_DAILY_LOSS_PCT: float   = 0.10
-    DAILY_RESET_HOUR_UTC: int   = 0         # reset daily_start balance at midnight UTC
+    # Circuit breaker — per-asset cooldown so one bad streak doesn't freeze all assets
+    MAX_CONSEC_LOSSES: int      = 4
+    COOLDOWN_MINUTES: float     = 25.0
+    PER_ASSET_CIRCUIT_BREAKER: bool = True
+    MAX_DAILY_LOSS_PCT: float   = 0.12
+    DAILY_RESET_HOUR_UTC: int   = 0
 
-    # Signal quality gates
-    LAG_CONFIDENCE_MIN: float   = 0.25     # lag_confidence_low threshold; below this → WAIT
-    MIN_CONVICTION: int         = 3         # of 5 signals must agree
-    SHARPE_MIN: float           = 1.2       # min Sharpe over last N trades
-    SHARPE_MIN_TRADES: int      = 20        # only apply Sharpe gate after this many trades
+    # Entry gates
+    LAG_CONFIDENCE_MIN: float   = 0.22      # lag_arb strategy only (see lag_arb.py)
+    LAG_ABSENT_MIN: float       = 0.15      # global floor — only enforced for lag_arb
+    CWM_MIN: float              = 0.027
+    ALPHA_EDGE_MIN: float       = 0.06      # was 0.10; too high for 15m binaries
+    ALPHA_EDGE_BAND_LOW: float  = 0.04
+    ALPHA_EDGE_LAG_MIN: float   = 0.30      # was hardcoded 0.50 in asset_engine
+    MIN_CONVICTION: int         = 3
+    SHARPE_MIN: float           = 1.0
+    SHARPE_MIN_TRADES: int      = 25
 
     # Volatility filter
-    VOL_HI: float               = 1.5       # annualised; above → no entry (crypto 15m commonly 100–200%+)
-    VOL_MID: float               = 0.60     # above → half position
+    VOL_HI: float               = 1.85
+    VOL_MID: float               = 0.60
+
+    # Early exit — looser stops; R6 showed MTM stops crystallized losses early
+    EARLY_EXIT_ENABLED: bool            = True
+    EARLY_EXIT_MIN_HOLD_SECS: float     = 180.0   # was 90; let position develop
+    EARLY_EXIT_LOSS_FRACTION: float     = 0.70    # was 0.50
+    EARLY_EXIT_SPOT_ADVERSE_BPS: float  = 10.0
+    EARLY_EXIT_MIN_TIME_LEFT_SECS: float = 180.0
+    EARLY_EXIT_MODERATE_LOSS_FRAC: float = 0.45   # was 0.30
 
     # Structural model: floor vol to prevent exploding z when realized vol is tiny (early window)
     MIN_STRUCTURAL_VOL: float   = 0.15     # 15% annualized; crypto typically 20–80%
@@ -83,8 +101,8 @@ class TradingConfig:
 
     # Window timing
     WINDOW_SECS: int            = 900       # 15 minutes
-    SKIP_OPEN_SECS: int         = 45        # wait for price discovery at window start
-    SKIP_CLOSE_SECS: int       = 30        # stop entering near expiry
+    SKIP_OPEN_SECS: int         = 20        # was 45; capture early dislocations
+    SKIP_CLOSE_SECS: int       = 45        # was 30; more caution near expiry
 
     # Staleness guard — reject Kalshi prices older than this
     PRICE_MAX_AGE_SECS: float   = 30.0

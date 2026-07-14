@@ -315,6 +315,69 @@ class AssetEngine:
         self.sim.save()
         return (exit_spot, pnl, 1)
 
+    def _maybe_early_exit(self, yes_prob: float) -> bool:
+        """
+        Cut losses when spot/market clearly turned against the open position.
+        Exits at current Kalshi mid (mark-to-market) instead of riding to binary 0/1.
+        """
+        if not cfg.EARLY_EXIT_ENABLED or self._open_pos is None:
+            return False
+
+        pos = self._open_pos
+        elapsed = time.time() - pos.entered_at
+        if elapsed < cfg.EARLY_EXIT_MIN_HOLD_SECS:
+            return False
+
+        ptb = pos.price_to_beat
+        spot = self.synthetic_spot.spot_mid
+        if ptb is None or spot is None or ptb <= 0 or spot <= 0:
+            return False
+
+        bps = cfg.EARLY_EXIT_SPOT_ADVERSE_BPS / 10_000.0
+        if pos.side == "yes":
+            adverse_spot = spot < ptb * (1.0 - bps)
+        else:
+            adverse_spot = spot > ptb * (1.0 + bps)
+
+        mtm_exit = yes_prob if pos.side == "yes" else (1.0 - yes_prob)
+        mtm_exit = max(0.01, min(0.99, mtm_exit))
+        premium = pos.entry_price * pos.contracts
+        unrealized = (mtm_exit - pos.entry_price) * pos.contracts
+        loss_frac = (-unrealized / premium) if premium > 0 and unrealized < 0 else 0.0
+
+        time_left = self._time_remaining_secs()
+        reason = None
+        if loss_frac >= cfg.EARLY_EXIT_LOSS_FRACTION:
+            reason = f"mtm_loss_{loss_frac:.0%}"
+        elif adverse_spot and time_left <= cfg.EARLY_EXIT_MIN_TIME_LEFT_SECS:
+            reason = "adverse_spot_late_window"
+        elif adverse_spot and loss_frac >= cfg.EARLY_EXIT_MODERATE_LOSS_FRAC:
+            reason = f"adverse_spot_mtm_{loss_frac:.0%}"
+
+        if not reason:
+            return False
+
+        log.warning(
+            f"[{self.spec.symbol}] EARLY EXIT ({reason}) | side={pos.side.upper()} "
+            f"entry={pos.entry_price:.3f} mtm={mtm_exit:.3f} | "
+            f"ptb={ptb:.4f} spot={spot:.4f} t_left={time_left:.0f}s"
+        )
+        pnl = self.sim.record(
+            ticker=pos.market_ticker,
+            asset=pos.asset,
+            entry=pos.entry_price,
+            exit_=mtm_exit,
+            contracts=pos.contracts,
+            strategy="early_exit",
+            window_id=_fmt_window_id(pos.window_id),
+            price_to_beat=ptb,
+            exit_spot=float(spot),
+            side=pos.side,
+        )
+        self._open_pos = None
+        self.sim.save()
+        return True
+
     # ─── Price update (called by Kalshi WS handler) ───────────────────────────
 
     def on_price_update(self, yes_prob: float) -> dict:
@@ -351,6 +414,9 @@ class AssetEngine:
         if not self._ticker:
             return self._wait("no_market", yes_prob)
 
+        if self._open_pos is not None and self._maybe_early_exit(yes_prob):
+            return self._wait("early_exit_done", yes_prob)
+
         self._total_ticks += 1
         d = self.make_decision(yes_prob)
         self._log_decision(d, yes_prob)
@@ -364,7 +430,7 @@ class AssetEngine:
 
     def make_decision(self, yes_price_raw: float) -> dict:
         # Circuit breaker
-        halted, halt_reason = self.sim.is_halted()
+        halted, halt_reason = self.sim.is_halted(self.spec.symbol)
         if halted:
             return self._wait(f"circuit_breaker({halt_reason})", yes_price_raw)
 
@@ -569,12 +635,12 @@ class AssetEngine:
             # Secondary entry: alpha overlay can drive entries when CWM is low but p_real diverges
             p_real_edge = abs(p_real - yes_price_raw)
             lag_conf = self.lag_tracker.lag_confidence
-            if p_real_edge >= 0.12 and lag_conf >= 0.50:
+            if p_real_edge >= cfg.ALPHA_EDGE_MIN and lag_conf >= cfg.ALPHA_EDGE_LAG_MIN:
                 # Allow trade via alpha-edge path (OR with CWM path)
                 action = "BUY_YES" if p_real > yes_price_raw else "BUY_NO"
                 ev = p_real - yes_price_raw
                 signal_strategy = "alpha_edge"
-            elif 0.08 <= p_real_edge < 0.12 and lag_conf >= 0.50:
+            elif cfg.ALPHA_EDGE_BAND_LOW <= p_real_edge < cfg.ALPHA_EDGE_MIN and lag_conf >= cfg.ALPHA_EDGE_LAG_MIN:
                 d = self._wait("alpha_edge_insufficient", yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
                 d.update(_tf_log_fields(tf))
                 d["strategy"] = signal.strategy
@@ -602,9 +668,9 @@ class AssetEngine:
         if conv < cfg.MIN_CONVICTION:
             return self._wait(f"conviction({conv}<{cfg.MIN_CONVICTION})", yes_price_raw)
 
-        # Lag gate: require detectable Kalshi lag behind Binance
+        # Lag gate: only lag_arb requires detectable Kalshi lag (strategy already checks in lag_arb.py)
         lag_conf = self.lag_tracker.lag_confidence
-        if lag_conf < 0.15:
+        if signal_strategy == "lag_arb" and lag_conf < cfg.LAG_ABSENT_MIN:
             return self._wait(f"lag_absent({lag_conf:.2f})", yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
 
         # Sharpe gate (after enough trades to be meaningful)
@@ -625,7 +691,7 @@ class AssetEngine:
         size_usd = min(self.sim.balance * frac, self.sim.balance * cfg.MAX_POS_PCT)
         size_usd = max(0.0, size_usd)
 
-        ok, reason = self.sim.can_trade(size_usd, abs(ev), min_edge)
+        ok, reason = self.sim.can_trade(size_usd, abs(ev), min_edge, asset=self.spec.symbol)
         if not ok:
             return self._wait(reason, yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
 

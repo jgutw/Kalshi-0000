@@ -58,7 +58,7 @@ class LagArbStrategy:
         dislocation = snapshot.get("dislocation", 1.0)
         time_remaining = snapshot.get("time_remaining_secs", 0.0)
 
-        if lag_confidence < 0.15:
+        if lag_confidence < cfg.LAG_ABSENT_MIN:
             return StrategySignal("lag_arb", 0.0, "WAIT", "lag_absent", self.diagnostics)
         if lag_confidence < cfg.LAG_CONFIDENCE_MIN:
             return StrategySignal("lag_arb", 0.0, "WAIT", "lag_confidence_low", self.diagnostics)
@@ -70,7 +70,7 @@ class LagArbStrategy:
             return StrategySignal("lag_arb", 0.0, "WAIT", "dislocation_high", self.diagnostics)
         if spot_confidence < 0.6:
             return StrategySignal("lag_arb", 0.0, "WAIT", "spot_confidence_low", self.diagnostics)
-        if cwm is None or abs(cwm) < 0.03:
+        if cwm is None or abs(cwm) < cfg.CWM_MIN:
             return StrategySignal("lag_arb", 0.0, "WAIT", "mispricing_weak", self.diagnostics)
         if time_remaining <= 60:
             return StrategySignal("lag_arb", 0.0, "WAIT", "time_remaining_low", self.diagnostics)

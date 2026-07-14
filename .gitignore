@@ -7,8 +7,10 @@ btc5m_decisions.jsonl
 kalshi_*.jsonl
 kalshi_sim.json
 logs/
+sessions/
 config_override.json
 __pycache__/
 *.pyc
 venv/
 run_*.txt
+*.xlsx
