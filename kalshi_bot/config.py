@@ -40,72 +40,93 @@ ASSETS: List[AssetSpec] = [
 
 @dataclass
 class TradingConfig:
-    # Active profile label (written to logs/session_meta.json)
-    CONFIG_PROFILE: str         = "lower_size_more_entries"
+    # R14: equity-based DD, vault-aware peaks, hourly activity mandate.
+    # Do NOT use live without further fill/settlement hardening.
+    CONFIG_PROFILE: str         = "disciplined_paper_v2"
 
-    # Kelly / position sizing — smaller, more frequent bets
-    KELLY_FRACTION: float       = 0.20
-    MIN_EDGE_PCT: float         = 0.025     # keep; market orders need edge cushion
-    MAX_POS_PCT: float          = 0.02      # 2% of bankroll per trade
+    # Kelly / position sizing — moderate (R12 half-size cut DD ~half)
+    KELLY_FRACTION: float       = 0.22
+    MIN_EDGE_PCT: float         = 0.015
+    MAX_POS_PCT: float          = 0.05      # 5% bankroll per trade
+    PORTFOLIO_GROSS_CAP: float  = 0.15      # ~3 concurrent max-size names
     MIN_TRADE_USD: float        = 5.0
 
-    # Circuit breaker — per-asset cooldown so one bad streak doesn't freeze all assets
-    MAX_CONSEC_LOSSES: int      = 4
-    COOLDOWN_MINUTES: float     = 25.0
+    # Circuit breaker
+    MAX_CONSEC_LOSSES: int      = 5
+    COOLDOWN_MINUTES: float     = 15.0
     PER_ASSET_CIRCUIT_BREAKER: bool = True
-    MAX_DAILY_LOSS_PCT: float   = 0.12
+    MAX_DAILY_LOSS_PCT: float   = 0.20
+    # Peak-to-trough on EQUITY (trading + vault); halt when breached
+    MAX_DRAWDOWN_PCT: float     = 0.25
+    DRAWDOWN_HALT_ENABLED: bool = True
+    DRAWDOWN_USE_EQUITY: bool   = True      # R13 fix: don't freeze on vault skims
     DAILY_RESET_HOUR_UTC: int   = 0
 
-    # Entry gates
-    LAG_CONFIDENCE_MIN: float   = 0.22      # lag_arb strategy only (see lag_arb.py)
-    LAG_ABSENT_MIN: float       = 0.15      # global floor — only enforced for lag_arb
-    CWM_MIN: float              = 0.027
-    ALPHA_EDGE_MIN: float       = 0.06      # was 0.10; too high for 15m binaries
-    ALPHA_EDGE_BAND_LOW: float  = 0.04
-    ALPHA_EDGE_LAG_MIN: float   = 0.30      # was hardcoded 0.50 in asset_engine
-    MIN_CONVICTION: int         = 3
-    SHARPE_MIN: float           = 1.0
-    SHARPE_MIN_TRADES: int      = 25
+    # If no closed trade for this long, ease soft gates + smaller probe size
+    ACTIVITY_MANDATE_ENABLED: bool = True
+    ACTIVITY_IDLE_SECS: float      = 3600.0   # ~1 hour
+    ACTIVITY_PROBE_SIZE_PCT: float = 0.025    # 2.5% book when probing
+    ACTIVITY_EDGE_SCALE: float     = 0.70     # min edge × this when idle
+    ACTIVITY_SPOT_CONF_FLOOR: float = 0.30    # allow thinner venue coverage when idle
+    ACTIVITY_LAG_SCALE: float      = 0.70
 
-    # Volatility filter
-    VOL_HI: float               = 1.85
-    VOL_MID: float               = 0.60
+    # Entry gates — R12: 4/4 losses were entry < 0.15; skipping them = +$40 only
+    MIN_ENTRY_PRICE: float      = 0.15      # hard reject lottery YES/NO
+    MAX_ENTRY_PRICE: float      = 0.85      # hard reject expensive favorites
+    LAG_CONFIDENCE_MIN: float   = 0.18
+    LAG_ABSENT_MIN: float       = 0.12
+    CWM_MIN: float              = 0.020
+    ALPHA_EDGE_ENABLED: bool    = True
+    ALPHA_EDGE_MIN: float       = 0.05
+    ALPHA_EDGE_BAND_LOW: float  = 0.03
+    ALPHA_EDGE_LAG_MIN: float   = 0.18
+    MIN_CONVICTION: int         = 2
+    P_BASE_CENTER_MIN: float    = 0.03
+    SHARPE_MIN: float           = -99.0
+    SHARPE_MIN_TRADES: int      = 10_000
 
-    # Early exit — looser stops; R6 showed MTM stops crystallized losses early
-    EARLY_EXIT_ENABLED: bool            = True
-    EARLY_EXIT_MIN_HOLD_SECS: float     = 180.0   # was 90; let position develop
-    EARLY_EXIT_LOSS_FRACTION: float     = 0.70    # was 0.50
-    EARLY_EXIT_SPOT_ADVERSE_BPS: float  = 10.0
-    EARLY_EXIT_MIN_TIME_LEFT_SECS: float = 180.0
-    EARLY_EXIT_MODERATE_LOSS_FRAC: float = 0.45   # was 0.30
+    # Volatility
+    VOL_HI: float               = 5.00
+    VOL_MID: float              = 2.50
 
-    # Structural model: floor vol to prevent exploding z when realized vol is tiny (early window)
-    MIN_STRUCTURAL_VOL: float   = 0.15     # 15% annualized; crypto typically 20–80%
+    # Spot feed
+    SPOT_CONFIDENCE_MIN: float  = 0.45
 
-    # p_base boundary: reject if outside [P_BASE_MIN, P_BASE_MAX]; loosened to 0.02/0.98 when structural_model_invalid dominates
+    # Early exit OFF — ride binary 0/1
+    EARLY_EXIT_ENABLED: bool            = False
+    EARLY_EXIT_MIN_HOLD_SECS: float     = 240.0
+    EARLY_EXIT_LOSS_FRACTION: float     = 0.85
+    EARLY_EXIT_SPOT_ADVERSE_BPS: float  = 15.0
+    EARLY_EXIT_MIN_TIME_LEFT_SECS: float = 120.0
+    EARLY_EXIT_MODERATE_LOSS_FRAC: float = 0.70
+
+    MIN_STRUCTURAL_VOL: float   = 0.15
+
+    # Structural band (still allow wide markets, but size/entry floors gate risk)
     P_BASE_MIN: float           = 0.05
     P_BASE_MAX: float           = 0.95
 
-    # Hawkes process (arXiv:2408.03594)
-    # Half-life ≈ ln(2)/HAWKES_DECAY seconds
-    # At 15-min windows we want ~15s half-life → HAWKES_DECAY = ln(2)/15 ≈ 0.046
-    # OLD value was 3.0 (0.23s half-life) which decayed before each poll
     HAWKES_DECAY: float         = 0.046
     HAWKES_ALPHA: float         = 0.8
-
-    # OFI rolling window
-    OFI_WINDOW_SECS: int       = 120       # 2-min window (wider for 15-min markets)
-
-    # Logit tracker
+    OFI_WINDOW_SECS: int        = 120
     LOGIT_EWM_ALPHA: float      = 0.15
 
-    # Window timing
-    WINDOW_SECS: int            = 900       # 15 minutes
-    SKIP_OPEN_SECS: int         = 20        # was 45; capture early dislocations
-    SKIP_CLOSE_SECS: int       = 45        # was 30; more caution near expiry
+    WINDOW_SECS: int            = 900
+    SKIP_OPEN_SECS: int         = 20
+    SKIP_CLOSE_SECS: int        = 30
+    PTB_CAPTURE_SECS: float     = 120.0
 
-    # Staleness guard — reject Kalshi prices older than this
-    PRICE_MAX_AGE_SECS: float   = 30.0
+    PRICE_MAX_AGE_SECS: float   = 60.0
+
+    # Variance sizing — shrink when price is far from 0.50
+    ENTRY_VAR_MILD_DIST: float  = 0.20      # |p-0.5| > 0.20 → mild shrink
+    ENTRY_VAR_HARD_DIST: float  = 0.30      # |p-0.5| > 0.30 → hard shrink
+    ENTRY_VAR_MILD_SCALE: float = 0.65
+    ENTRY_VAR_HARD_SCALE: float = 0.40
+    BELIEF_VOL_MILD: float      = 0.06
+    BELIEF_VOL_HARD: float      = 0.12
+    BELIEF_VOL_MILD_SCALE: float = 0.70
+    BELIEF_VOL_HARD_SCALE: float = 0.40
 
     # Simulation
     SIM_BALANCE: float          = 1000.0
@@ -129,8 +150,6 @@ class APIConfig:
     OKX_WS: str = "wss://ws.okx.com:8443/ws/v5/public"
 
     # Kalshi endpoints
-    # Set KALSHI_BASE_URL in .env to override (e.g. if API has moved)
-    # Set KALSHI_DEMO=true for demo environment
     @property
     def KALSHI_REST(self) -> str:
         override = os.getenv("KALSHI_BASE_URL")
@@ -147,13 +166,8 @@ class APIConfig:
         return "wss://api.elections.kalshi.com/trade-api/ws/v2"
 
 
-# ─── Micro alpha model overrides ─────────────────────────────────────────────
-# Per-asset coefficient overrides. Empty = all assets use defaults.
-# Example: {"BTC": {"lag_signal": 0.50}, "ETH": {"lag_signal": 0.35}}
 MICRO_ALPHA_OVERRIDES: dict = {}
 
-# ─── Macro blackout windows (UTC weekday, hour, minute) ───────────────────────
-# arXiv:2508.06788 — avoid trading around macro announcements
 BLACKOUT_WINDOWS = [
     (2, 18,  0),   # FOMC Wednesday 18:00 UTC
     (1, 12, 30),   # CPI Tuesday 12:30 UTC
@@ -162,6 +176,5 @@ BLACKOUT_WINDOWS = [
 BLACKOUT_HALF_WIDTH_SECS = 300
 
 
-# ─── Shared singletons ───────────────────────────────────────────────────────
 cfg     = TradingConfig()
 api_cfg = APIConfig()

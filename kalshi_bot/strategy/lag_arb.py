@@ -68,7 +68,7 @@ class LagArbStrategy:
             return StrategySignal("lag_arb", 0.0, "WAIT", "kalshi_spread_wide", self.diagnostics)
         if dislocation >= 0.002:
             return StrategySignal("lag_arb", 0.0, "WAIT", "dislocation_high", self.diagnostics)
-        if spot_confidence < 0.6:
+        if spot_confidence < cfg.SPOT_CONFIDENCE_MIN:
             return StrategySignal("lag_arb", 0.0, "WAIT", "spot_confidence_low", self.diagnostics)
         if cwm is None or abs(cwm) < cfg.CWM_MIN:
             return StrategySignal("lag_arb", 0.0, "WAIT", "mispricing_weak", self.diagnostics)

@@ -32,6 +32,8 @@ ARCHIVE_LOG_FILES = (
     "kalshi_features.jsonl",
     "session_meta.json",
     "near_misses.csv",
+    "vault_config.json",
+    "vault_skims.jsonl",
 )
 
 
@@ -73,20 +75,34 @@ def _config_levels() -> dict[str, Any]:
         "KELLY_FRACTION": cfg.KELLY_FRACTION,
         "MIN_EDGE_PCT": cfg.MIN_EDGE_PCT,
         "MAX_POS_PCT": cfg.MAX_POS_PCT,
+        "MIN_ENTRY_PRICE": getattr(cfg, "MIN_ENTRY_PRICE", 0.0),
+        "MAX_ENTRY_PRICE": getattr(cfg, "MAX_ENTRY_PRICE", 1.0),
         "LAG_CONFIDENCE_MIN": cfg.LAG_CONFIDENCE_MIN,
         "CWM_MIN": cfg.CWM_MIN,
+        "ALPHA_EDGE_ENABLED": cfg.ALPHA_EDGE_ENABLED,
         "ALPHA_EDGE_MIN": cfg.ALPHA_EDGE_MIN,
         "ALPHA_EDGE_BAND_LOW": cfg.ALPHA_EDGE_BAND_LOW,
         "ALPHA_EDGE_LAG_MIN": cfg.ALPHA_EDGE_LAG_MIN,
         "LAG_ABSENT_MIN": cfg.LAG_ABSENT_MIN,
+        "P_BASE_CENTER_MIN": cfg.P_BASE_CENTER_MIN,
+        "PTB_CAPTURE_SECS": cfg.PTB_CAPTURE_SECS,
+        "SKIP_OPEN_SECS": cfg.SKIP_OPEN_SECS,
+        "SKIP_CLOSE_SECS": cfg.SKIP_CLOSE_SECS,
         "VOL_HI": cfg.VOL_HI,
         "VOL_MID": cfg.VOL_MID,
+        "SPOT_CONFIDENCE_MIN": cfg.SPOT_CONFIDENCE_MIN,
         "MIN_CONVICTION": cfg.MIN_CONVICTION,
         "SHARPE_MIN": cfg.SHARPE_MIN,
         "SHARPE_MIN_TRADES": cfg.SHARPE_MIN_TRADES,
         "MAX_CONSEC_LOSSES": cfg.MAX_CONSEC_LOSSES,
         "COOLDOWN_MINUTES": cfg.COOLDOWN_MINUTES,
         "PER_ASSET_CIRCUIT_BREAKER": cfg.PER_ASSET_CIRCUIT_BREAKER,
+        "MAX_DAILY_LOSS_PCT": cfg.MAX_DAILY_LOSS_PCT,
+        "MAX_DRAWDOWN_PCT": getattr(cfg, "MAX_DRAWDOWN_PCT", 0.25),
+        "DRAWDOWN_HALT_ENABLED": getattr(cfg, "DRAWDOWN_HALT_ENABLED", True),
+        "DRAWDOWN_USE_EQUITY": getattr(cfg, "DRAWDOWN_USE_EQUITY", True),
+        "ACTIVITY_MANDATE_ENABLED": getattr(cfg, "ACTIVITY_MANDATE_ENABLED", True),
+        "ACTIVITY_IDLE_SECS": getattr(cfg, "ACTIVITY_IDLE_SECS", 3600.0),
         "EARLY_EXIT_ENABLED": cfg.EARLY_EXIT_ENABLED,
         "P_BASE_MIN": cfg.P_BASE_MIN,
         "P_BASE_MAX": cfg.P_BASE_MAX,
@@ -95,7 +111,10 @@ def _config_levels() -> dict[str, Any]:
         "assets_enabled": [a.symbol for a in ASSETS if a.enabled],
         "optimizations": {
             "XRP_disabled": not any(a.symbol == "XRP" and a.enabled for a in ASSETS),
-            "note": "lower_size_more_entries: smaller Kelly, looser alpha/early-exit, lag gate lag_arb-only",
+            "note": (
+                "disciplined_paper_v2: entry band [MIN,MAX], equity DD halt, "
+                "vault reduces peak_balance on skim, 1h activity mandate — PAPER ONLY"
+            ),
         },
     }
 

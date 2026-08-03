@@ -96,6 +96,12 @@ class SimState:
     # Per-asset stats
     asset_stats:   dict  = field(default_factory=dict)   # symbol → AssetStats
 
+    # Profit vault (taken cash — not used for new trades)
+    vault_balance: float = 0.0
+    peak_equity:   float = field(default_factory=lambda: cfg.SIM_BALANCE)
+    last_trade_ts: float = 0.0   # unix time of last closed trade (0 = none yet)
+    session_started_ts: float = field(default_factory=time.time)
+
     # ─── Properties ───────────────────────────────────────────────────────────
 
     @property
@@ -112,9 +118,57 @@ class SimState:
 
     @property
     def daily_dd(self) -> float:
+        """Daily drawdown on trading balance (legacy daily loss gate)."""
         if self.daily_start <= 0:
             return 0.0
         return (self.daily_start - self.balance) / self.daily_start
+
+    @property
+    def total_equity(self) -> float:
+        """Trading balance + vault (full paper economic equity)."""
+        return float(self.balance) + float(self.vault_balance)
+
+    @property
+    def peak_drawdown(self) -> float:
+        """
+        Peak-to-trough drawdown (fraction 0–1).
+        Default: equity-based so vault skims do not freeze trading.
+        """
+        if getattr(cfg, "DRAWDOWN_USE_EQUITY", True):
+            peak = float(self.peak_equity or 0.0)
+            cur = self.total_equity
+        else:
+            peak = float(self.peak_balance or 0.0)
+            cur = float(self.balance)
+        if peak <= 0:
+            return 0.0
+        return max(0.0, (peak - cur) / peak)
+
+    @property
+    def skimmable_profit(self) -> float:
+        """Profit above session starting capital still sitting in the trading book."""
+        return max(0.0, float(self.balance) - float(self.starting_balance))
+
+    def seconds_since_last_trade(self) -> float:
+        """Seconds since last closed trade; uses session start if none yet."""
+        anchor = self.last_trade_ts if self.last_trade_ts > 0 else self.session_started_ts
+        if anchor <= 0:
+            return 0.0
+        return max(0.0, time.time() - anchor)
+
+    def activity_idle(self) -> bool:
+        """True when activity mandate should loosen soft gates."""
+        if not getattr(cfg, "ACTIVITY_MANDATE_ENABLED", False):
+            return False
+        idle_for = float(getattr(cfg, "ACTIVITY_IDLE_SECS", 3600.0))
+        return self.seconds_since_last_trade() >= idle_for
+
+    def _touch_peaks(self) -> None:
+        if self.balance > self.peak_balance:
+            self.peak_balance = self.balance
+        eq = self.total_equity
+        if eq > self.peak_equity:
+            self.peak_equity = eq
 
     def gross_open_exposure(self, open_positions: List[OpenPosition]) -> float:
         """Sum of all open position sizes as fraction of balance."""
@@ -133,6 +187,14 @@ class SimState:
         self._maybe_reset_daily()
         if self.daily_dd >= cfg.MAX_DAILY_LOSS_PCT:
             return True, f"daily_loss {self.daily_dd:.1%}"
+        if (
+            getattr(cfg, "DRAWDOWN_HALT_ENABLED", True)
+            and self.peak_drawdown >= getattr(cfg, "MAX_DRAWDOWN_PCT", 0.25)
+        ):
+            basis = "equity" if getattr(cfg, "DRAWDOWN_USE_EQUITY", True) else "trading"
+            return True, (
+                f"max_drawdown_{basis} {self.peak_drawdown:.1%}>={cfg.MAX_DRAWDOWN_PCT:.0%}"
+            )
 
         if cfg.PER_ASSET_CIRCUIT_BREAKER and asset:
             streak = int(self.consec_losses_by_asset.get(asset, 0))
@@ -257,8 +319,8 @@ class SimState:
         if ref > 0:
             self.returns_hist.append(pnl / ref)
 
-        if self.balance > self.peak_balance:
-            self.peak_balance = self.balance
+        self.last_trade_ts = time.time()
+        self._touch_peaks()
 
         # Per-asset stats
         s = self.asset_stats.setdefault(asset, AssetStats(asset))
@@ -273,6 +335,15 @@ class SimState:
 
         self._update_risk()
 
+        # Auto profit-skim after each close (no-op unless vault auto is enabled)
+        skimmed = self.maybe_auto_skim()
+        if skimmed > 0:
+            log.info(
+                f"VAULT auto-skim ${skimmed:.2f} | trading=${self.balance:.2f} "
+                f"vault=${self.vault_balance:.2f} equity=${self.total_equity:.2f}"
+            )
+        self._touch_peaks()
+
         pnl_str = f"+{pnl:.2f}" if pnl >= 0 else f"{pnl:.2f}"
         log.info(f"{'WIN' if won else 'LOSS'} [{asset}] PnL=${pnl_str}  "
                  f"Balance=${self.balance:.2f}  WR={self.win_rate:.1%}  "
@@ -281,7 +352,13 @@ class SimState:
         # JSONL log (include window_id for grouping)
         try:
             Path(TRADE_LOG).parent.mkdir(parents=True, exist_ok=True)
-            out = {**trade, "balance": self.balance, "win_rate": self.win_rate}
+            out = {
+                **trade,
+                "balance": self.balance,
+                "vault": self.vault_balance,
+                "equity": self.total_equity,
+                "win_rate": self.win_rate,
+            }
             if not out.get("window_id"):
                 out.pop("window_id", None)
             if out.get("price_to_beat") is None:
@@ -296,6 +373,62 @@ class SimState:
             pass
 
         return pnl
+
+    def take_cash(self, amount: float, reason: str = "manual") -> float:
+        """
+        Move profit from trading balance into the vault.
+        Only skims up to skimmable_profit (never dips below starting_balance).
+        Returns dollars actually moved.
+        """
+        try:
+            amount = float(amount)
+        except (TypeError, ValueError):
+            return 0.0
+        amount = min(max(0.0, amount), self.skimmable_profit)
+        if amount < 0.01:
+            return 0.0
+
+        self.balance -= amount
+        self.vault_balance += amount
+        # Skim must not invent trading drawdown vs an old peak
+        self.peak_balance = max(self.balance, self.peak_balance - amount)
+        # Equity unchanged → peak_equity unchanged; still refresh for safety
+        self._touch_peaks()
+
+        event = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "amount": round(amount, 4),
+            "reason": reason,
+            "balance_after": round(self.balance, 4),
+            "vault_after": round(self.vault_balance, 4),
+            "equity_after": round(self.total_equity, 4),
+            "peak_balance_after": round(self.peak_balance, 4),
+            "peak_equity_after": round(self.peak_equity, 4),
+        }
+        try:
+            from .vault import _append_skim
+            _append_skim(event)
+        except Exception:
+            pass
+        log.info(
+            f"TAKE CASH ${amount:.2f} ({reason}) | "
+            f"trading=${self.balance:.2f} vault=${self.vault_balance:.2f} "
+            f"peak_bal=${self.peak_balance:.2f}"
+        )
+        return amount
+
+    def maybe_auto_skim(self) -> float:
+        """If auto vault is on and profit >= trigger, skim skim_amount once."""
+        try:
+            from .vault import load_vault_config
+            vcfg = load_vault_config()
+        except Exception:
+            return 0.0
+        if not vcfg.auto_enabled or vcfg.skim_amount <= 0:
+            return 0.0
+        if self.skimmable_profit < vcfg.profit_trigger:
+            return 0.0
+        return self.take_cash(vcfg.skim_amount, reason="auto")
 
     def _update_risk(self) -> None:
         if len(self.returns_hist) < 20:
@@ -338,6 +471,11 @@ class SimState:
                     "var_95":           self.var_95,
                     "cvar_95":          self.cvar_95,
                     "vol_regime":       self.vol_regime,
+                    "vault_balance":    self.vault_balance,
+                    "peak_equity":      self.peak_equity,
+                    "total_equity":     self.total_equity,
+                    "last_trade_ts":    self.last_trade_ts,
+                    "session_started_ts": self.session_started_ts,
                     "returns_hist":     self.returns_hist[-500:],
                     "trades":           self.trades[-100:],
                     "asset_stats":      asset_stats_raw,
@@ -367,16 +505,23 @@ class SimState:
             s.var_95           = d.get("var_95",           0.0)
             s.cvar_95          = d.get("cvar_95",          0.0)
             s.vol_regime       = d.get("vol_regime",       "normal")
+            s.vault_balance    = float(d.get("vault_balance", 0.0) or 0.0)
+            s.peak_equity      = float(d.get("peak_equity", s.balance + s.vault_balance) or (s.balance + s.vault_balance))
+            s.last_trade_ts    = float(d.get("last_trade_ts", 0.0) or 0.0)
+            s.session_started_ts = float(d.get("session_started_ts", time.time()) or time.time())
             s.returns_hist     = d.get("returns_hist",     [])
             s.trades           = d.get("trades",           [])
             # Restore per-asset stats
             for k, v in d.get("asset_stats", {}).items():
                 if isinstance(v, dict):
                     s.asset_stats[k] = AssetStats(**v)
+            s._touch_peaks()
             return s
         except FileNotFoundError:
             s = cls()
             s.daily_start_ts = time.time()
+            s.session_started_ts = time.time()
+            s.peak_equity = s.balance
             return s
 
     def reconcile_from_trade_log(self, trade_log_path: str | Path = None) -> bool:
@@ -405,15 +550,16 @@ class SimState:
         old_total = self.total_trades
         if len(trades) <= old_total:
             return False
-        # Rebuild from trade log
+        # Rebuild from trade log (preserve vault; trading book = start + pnl - vault)
         start = self.starting_balance
+        vault = float(self.vault_balance or 0.0)
         wins = sum(1 for t in trades if float(t.get("pnl", 0)) > 0)
         losses = len(trades) - wins
         total_pnl = sum(float(t.get("pnl", 0)) for t in trades)
         self.total_trades = len(trades)
         self.wins = wins
         self.losses = losses
-        self.balance = start + total_pnl
+        self.balance = start + total_pnl - vault
         self.peak_balance = max(self.peak_balance, self.balance)
         # Per-asset stats
         by_asset = {}

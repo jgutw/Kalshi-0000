@@ -594,3 +594,26 @@ def kelly_binary(p_hat: float, q_market: float) -> float:
         return 0.0
     full_kelly = edge / (1.0 - q_market)
     return min(full_kelly * cfg.KELLY_FRACTION, cfg.MAX_POS_PCT)
+
+
+def entry_variance_scalar(entry_price: float) -> float:
+    """
+    Shrink size when contract price is lottery-like (far from 0.50).
+    Extreme prices amplify miscalibration / payoff skew and hurt Sharpe.
+    """
+    d = abs(float(entry_price) - 0.5)
+    if d <= cfg.ENTRY_VAR_MILD_DIST:
+        return 1.0
+    if d <= cfg.ENTRY_VAR_HARD_DIST:
+        return cfg.ENTRY_VAR_MILD_SCALE
+    return cfg.ENTRY_VAR_HARD_SCALE
+
+
+def belief_vol_scalar(belief_vol: float) -> float:
+    """Shrink size when Kalshi logit belief is noisy."""
+    bv = float(belief_vol) if belief_vol is not None else 0.0
+    if bv >= cfg.BELIEF_VOL_HARD:
+        return cfg.BELIEF_VOL_HARD_SCALE
+    if bv >= cfg.BELIEF_VOL_MILD:
+        return cfg.BELIEF_VOL_MILD_SCALE
+    return 1.0

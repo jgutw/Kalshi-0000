@@ -50,20 +50,23 @@ snapshots = store.get_latest_snapshots()
 decisions = store.get_decisions(last_n=500)
 
 # Row 1: Portfolio metrics bar
-c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+equity = portfolio.total_equity or (portfolio.balance + portfolio.vault_balance)
+total_pnl = equity - portfolio.starting_balance
+pnl_pct = (total_pnl / portfolio.starting_balance * 100) if portfolio.starting_balance else 0
 with c1:
-    st.metric("Balance", f"${portfolio.balance:,.2f}")
+    st.metric("Trading", f"${portfolio.balance:,.2f}")
 with c2:
-    pnl = portfolio.balance - portfolio.starting_balance
-    pnl_pct = (pnl / portfolio.starting_balance * 100) if portfolio.starting_balance else 0
-    st.metric("P&L", f"${pnl:+,.2f}", f"{pnl_pct:+.1f}%")
+    st.metric("Vault", f"${portfolio.vault_balance:,.2f}")
 with c3:
-    st.metric("Win Rate", f"{portfolio.win_rate:.1%}")
+    st.metric("Equity", f"${equity:,.2f}", f"{pnl_pct:+.1f}%")
 with c4:
-    st.metric("Sharpe", f"{portfolio.sharpe:.2f}")
+    st.metric("Win Rate", f"{portfolio.win_rate:.1%}")
 with c5:
-    st.metric("VaR 95%", f"{portfolio.var_95:.2%}")
+    st.metric("Sharpe", f"{portfolio.sharpe:.2f}")
 with c6:
+    st.metric("VaR 95%", f"{portfolio.var_95:.2%}")
+with c7:
     if portfolio.halt_state:
         st.markdown(f'<span style="color:#cc0000">HALTED — {portfolio.halt_reason}</span>', unsafe_allow_html=True)
     else:

@@ -241,4 +241,7 @@ def generate_portfolio() -> PortfolioSnapshot:
             "SOL": {"wins": 1, "losses": 1, "total_pnl": 6.0},
             "XRP": {"wins": 2, "losses": 0, "total_pnl": 7.4},
         },
+        vault_balance=0.0,
+        total_equity=1002.6,
+        skimmable_profit=2.6,
     )

@@ -33,15 +33,12 @@ PATHS = [
 
 def _files_exist_and_nonempty() -> bool:
     """Live mode: kalshi_sim.json and kalshi_decisions.jsonl must exist and be non-empty.
-    kalshi_trades.jsonl may be empty (no trades yet)."""
+    kalshi_trades.jsonl may be missing or empty (no trades yet in a fresh round)."""
     sim = LOGS_DIR / "kalshi_sim.json"
     decisions = LOGS_DIR / "kalshi_decisions.jsonl"
-    trades = LOGS_DIR / "kalshi_trades.jsonl"
     if not sim.exists() or sim.stat().st_size == 0:
         return False
     if not decisions.exists() or decisions.stat().st_size == 0:
-        return False
-    if not trades.exists():
         return False
     return True
 

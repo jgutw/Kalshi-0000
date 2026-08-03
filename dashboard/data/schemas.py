@@ -107,3 +107,6 @@ class PortfolioSnapshot:
     halt_state: bool
     halt_reason: str
     asset_stats: Dict[str, Dict[str, Any]]
+    vault_balance: float = 0.0
+    total_equity: float = 0.0
+    skimmable_profit: float = 0.0

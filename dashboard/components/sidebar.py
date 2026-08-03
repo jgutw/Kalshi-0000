@@ -9,6 +9,7 @@ import time
 import streamlit as st
 
 from ..data.state_store import StateStore
+from .vault_panel import render_vault_panel
 
 
 def render_sidebar() -> bool:
@@ -27,10 +28,13 @@ def render_sidebar() -> bool:
             st.divider()
 
         portfolio = store.get_portfolio()
-        pnl = portfolio.balance - portfolio.starting_balance
-        pnl_pct = (pnl / portfolio.starting_balance * 100) if portfolio.starting_balance else 0
+        equity = portfolio.total_equity or (portfolio.balance + portfolio.vault_balance)
+        total_pnl = equity - portfolio.starting_balance
+        pnl_pct = (total_pnl / portfolio.starting_balance * 100) if portfolio.starting_balance else 0
 
-        st.metric("Balance", f"${portfolio.balance:,.2f}", f"{pnl_pct:+.1f}%")
+        st.metric("Trading", f"${portfolio.balance:,.2f}")
+        st.metric("Vault", f"${portfolio.vault_balance:,.2f}")
+        st.metric("Equity", f"${equity:,.2f}", f"{pnl_pct:+.1f}%")
         st.metric("Win Rate", f"{portfolio.win_rate:.1%}", None)
         st.metric("Sharpe", f"{portfolio.sharpe:.2f}", None)
 
@@ -59,6 +63,8 @@ def render_sidebar() -> bool:
                     st.markdown(f"🟢 {asset}")
             else:
                 st.markdown(f"⚪ {asset}")
+
+        render_vault_panel()
 
         st.divider()
         auto_refresh = st.toggle("Auto-refresh", value=True)

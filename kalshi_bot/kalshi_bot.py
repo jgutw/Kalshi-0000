@@ -222,13 +222,26 @@ class KalshiMultiBot:
         print("  KALSHI MULTI-ASSET 15-MIN BOT — STATUS")
         print("=" * 62)
         print(f"  Balance:    ${s.balance:>10,.2f}  (start ${s.starting_balance:.2f})")
-        print(f"  P&L:        ${pnl:>+10,.2f}  ({(s.balance/s.starting_balance - 1):+.1%})")
+        eq_pnl = s.total_equity - s.starting_balance
+        print(f"  Vault:      ${s.vault_balance:>10,.2f}  equity ${s.total_equity:,.2f}")
+        print(f"  P&L:        ${eq_pnl:>+10,.2f}  equity ({(s.total_equity/s.starting_balance - 1):+.1%})")
         print(f"  Trades:     {s.total_trades}  W={s.wins} L={s.losses}  WR={s.win_rate:.1%}")
         print(f"  Sharpe:     {s.current_sharpe:.2f}   VaR95={s.var_95:.2%}")
+        dd_basis = "equity" if getattr(cfg, "DRAWDOWN_USE_EQUITY", True) else "trading"
+        dd_note = (
+            f"halt@{cfg.MAX_DRAWDOWN_PCT:.0%} {dd_basis}"
+            if getattr(cfg, "DRAWDOWN_HALT_ENABLED", True)
+            else "halt off"
+        )
+        print(f"  Peak DD:    {s.peak_drawdown:.1%}  ({dd_note})")
+        idle_m = s.seconds_since_last_trade() / 60.0
+        if getattr(cfg, "ACTIVITY_MANDATE_ENABLED", False):
+            probe = "PROBE ON" if s.activity_idle() else "normal"
+            print(f"  Activity:   idle {idle_m:.0f}m  ({probe})")
         print(f"  Mode:       {'PAPER' if cfg.DRY_RUN else '⚠ LIVE'}")
         halted, reason = s.is_halted()
         if halted:
-            print(f"  ⛔ HALTED:  {reason}")
+            print(f"  HALTED:     {reason}")
         print()
         for sym, eng in self.engines.items():
             stats = s.asset_stats.get(sym)
@@ -448,6 +461,17 @@ class KalshiMultiBot:
             self.print_status()
             self.sim.save()
 
+    async def vault_poll(self) -> None:
+        """Apply dashboard take-cash / vault-config commands every few seconds."""
+        from .vault import process_vault_commands
+        while True:
+            await asyncio.sleep(5)
+            try:
+                if process_vault_commands(self.sim):
+                    self.sim.save()
+            except Exception as e:
+                log.warning("vault_poll failed: %s", e)
+
     # ─── Venue warmup check ────────────────────────────────────────────────────
 
     async def _warmup_check(self) -> None:
@@ -481,6 +505,7 @@ class KalshiMultiBot:
             tasks.append(self.run_price_feed(engine))
 
         tasks.append(self.heartbeat())
+        tasks.append(self.vault_poll())
         tasks.append(self.recorder.run())
         tasks.append(self._warmup_check())
 
@@ -526,13 +551,19 @@ def main() -> None:
     parser.add_argument("--debug",    action="store_true",  help="Enable DEBUG logging (orderbook, etc.)")
     parser.add_argument(
         "--session-tag",
-        default="round_7_lower_size",
+        default="round_14_disciplined_paper_v2",
         help="Label for logs/session_meta.json (run mode only)",
     )
     parser.add_argument(
         "--fresh-round",
         action="store_true",
-        help="Archive logs/ to sessions/, reset sim to $1000, then start",
+        help="Archive logs/ to sessions/, reset sim to SIM_BALANCE, then start",
+    )
+    parser.add_argument(
+        "--sim-balance",
+        type=float,
+        default=None,
+        help="Paper starting capital (e.g. 500). Applied before --fresh-round.",
     )
     args = parser.parse_args()
 
@@ -546,6 +577,11 @@ def main() -> None:
         cfg.KELLY_FRACTION = args.kelly
     if args.min_edge:
         cfg.MIN_EDGE_PCT = args.min_edge
+    if args.sim_balance is not None:
+        if args.sim_balance <= 0:
+            raise SystemExit("--sim-balance must be > 0")
+        cfg.SIM_BALANCE = float(args.sim_balance)
+        log.info("Paper starting capital set to $%.2f", cfg.SIM_BALANCE)
     if args.no_xrp:
         for spec in ASSETS:
             if spec.symbol == "XRP":

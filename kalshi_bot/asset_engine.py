@@ -38,6 +38,7 @@ from .data.synthetic_spot import SyntheticSpotEstimator
 from .signal_engine import (
     AssetSignalEngine, LogitPriceTracker,
     vol_position_scalar, kelly_binary,
+    entry_variance_scalar, belief_vol_scalar,
     sigmoid, logit,
 )
 from .sim_state import SimState, OpenPosition
@@ -63,6 +64,23 @@ def _tf_log_fields(tf) -> dict:
         "spot_confidence": tf.spot_confidence,
         "lag_confidence": tf.lag_confidence,
     }
+
+
+def _floor_strike_from_market(market: Optional[dict]) -> Optional[float]:
+    """
+    Kalshi 15m crypto markets expose the official window-open target as floor_strike.
+    Prefer this over synthetic spot — mid-window joins otherwise invent a wrong threshold.
+    """
+    if not market:
+        return None
+    raw = market.get("floor_strike")
+    if raw is None or raw == "":
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return val if val > 0 else None
 
 
 def _is_in_blackout(now: Optional[datetime] = None) -> bool:
@@ -118,6 +136,8 @@ class AssetEngine:
         self._window_start: Optional[float] = None
         self._close_time_utc: Optional[str]  = None  # Kalshi ISO UTC e.g. "2026-03-18T12:30:00Z"
         self._price_to_beat: Optional[float] = None
+        self._price_to_beat_source: str = ""  # "floor_strike" | "window_open_spot" | ""
+        self._ptb_floor_refresh_attempted: int = -1  # window_id we already re-fetched for strike
 
         # Open position for this asset
         self._open_pos: Optional[OpenPosition] = None
@@ -244,18 +264,29 @@ class AssetEngine:
             self._ticker = ""
             self._close_time_utc = None
 
-        # Record price-to-beat: prefer synthetic_spot (robust), never use 0 or stale
-        sm = self.synthetic_spot.spot_mid
-        if sm is not None and sm > 0:
-            self._price_to_beat = float(sm)
-        elif self.signal.prices:
-            p = float(self.signal.prices[-1])
-            self._price_to_beat = p if p > 0 else None
+        # Official Kalshi floor_strike first; else capture synthetic spot only at window open
+        self._price_to_beat = None
+        self._price_to_beat_source = ""
+        floor = _floor_strike_from_market(self._market)
+        if floor is not None:
+            self._price_to_beat = floor
+            self._price_to_beat_source = "floor_strike"
         else:
-            self._price_to_beat = None
+            sm = self.synthetic_spot.spot_mid
+            if sm is not None and sm > 0:
+                self._price_to_beat = float(sm)
+                self._price_to_beat_source = "window_open_spot"
+            elif self.signal.prices:
+                p = float(self.signal.prices[-1])
+                if p > 0:
+                    self._price_to_beat = p
+                    self._price_to_beat_source = "window_open_spot"
 
         ptb = f"{self._price_to_beat:.4f}" if self._price_to_beat else "N/A"
-        log.info(f"[{self.spec.symbol}] price_to_beat={ptb}")
+        log.info(
+            f"[{self.spec.symbol}] price_to_beat={ptb} "
+            f"source={self._price_to_beat_source or 'pending'}"
+        )
 
     # ─── Position resolution ──────────────────────────────────────────────────
 
@@ -434,6 +465,17 @@ class AssetEngine:
         if halted:
             return self._wait(f"circuit_breaker({halt_reason})", yes_price_raw)
 
+        # Activity mandate: after long idle, ease soft gates / smaller size (not hard risk)
+        activity_probe = self.sim.activity_idle()
+        spot_conf_min = (
+            min(cfg.SPOT_CONFIDENCE_MIN, getattr(cfg, "ACTIVITY_SPOT_CONF_FLOOR", 0.30))
+            if activity_probe else cfg.SPOT_CONFIDENCE_MIN
+        )
+        lag_absent_min = (
+            cfg.LAG_ABSENT_MIN * float(getattr(cfg, "ACTIVITY_LAG_SCALE", 0.70))
+            if activity_probe else cfg.LAG_ABSENT_MIN
+        )
+
         # Signal warmup — MUST block all trades; no strategy can bypass this
         if not self.signal.is_ready():
             return self._wait("signal_warmup", yes_price_raw)
@@ -453,9 +495,9 @@ class AssetEngine:
         # Venue dislocation guard (protects against feed anomalies)
         if self.synthetic_spot.dislocation > 0.002:
             return self._wait("venue_dislocation", yes_price_raw)
-        # Require >= 2 fresh venues (conf >= 0.6) — 1 venue = 0.3, 2 = 0.6
+        # Require enough fresh venues (1≈0.3, 2≈0.6); threshold from config
         spot_conf = self.synthetic_spot.confidence
-        if spot_conf < 0.6:
+        if spot_conf < spot_conf_min:
             return self._wait("spot_confidence_low", yes_price_raw)
 
         # Volatility filter
@@ -464,7 +506,7 @@ class AssetEngine:
         if vol_scalar == 0.0:
             return self._wait(f"vol_too_high({rv:.2f})", yes_price_raw)
 
-        # Get spot_now early (needed for lazy price_to_beat and structural model)
+        # Get spot_now early (needed for structural model)
         time_remaining = self._time_remaining_secs()
         sm = self.synthetic_spot.spot_mid
         if sm is not None and sm > 0:
@@ -474,10 +516,37 @@ class AssetEngine:
         else:
             spot_now = None
 
-        # Lazy init price_to_beat when bot joins mid-window (feeds weren't ready at on_window_advance)
+        # Resolve price_to_beat: official floor_strike preferred; never invent mid-window strike
+        if self._price_to_beat_source != "floor_strike":
+            floor = _floor_strike_from_market(self._market)
+            if (
+                floor is None
+                and self._ticker
+                and self._ptb_floor_refresh_attempted != self._window_id
+            ):
+                # Refresh THIS ticker only (do not re-discover active market — that can
+                # replace a deliberate/test PTB with an unrelated live strike).
+                self._ptb_floor_refresh_attempted = self._window_id
+                m = self.kalshi.get_market(self._ticker)
+                if m:
+                    self._market = m
+                    floor = _floor_strike_from_market(m)
+            if floor is not None:
+                self._price_to_beat = floor
+                self._price_to_beat_source = "floor_strike"
+                log.info(f"[{self.spec.symbol}] price_to_beat from floor_strike={floor:.2f}")
+
         if self._price_to_beat is None and spot_now is not None and spot_now > 0:
-            self._price_to_beat = spot_now
-            log.info(f"[{self.spec.symbol}] price_to_beat lazily set to {spot_now:.2f} (mid-window join)")
+            elapsed = (time.time() - self._window_start) if self._window_start else 9999.0
+            if elapsed <= cfg.PTB_CAPTURE_SECS:
+                self._price_to_beat = spot_now
+                self._price_to_beat_source = "window_open_spot"
+                log.info(
+                    f"[{self.spec.symbol}] price_to_beat from open spot={spot_now:.2f} "
+                    f"(elapsed={elapsed:.0f}s<{cfg.PTB_CAPTURE_SECS:.0f}s)"
+                )
+            else:
+                return self._wait("price_to_beat_unreliable", yes_price_raw)
 
         # Require price-to-beat for threshold distance
         if self._price_to_beat is None:
@@ -500,6 +569,8 @@ class AssetEngine:
         # Smooth market price
         p_market = self.tracker.update(yes_price_raw)
         min_edge = self.tracker.adjusted_min_edge
+        if activity_probe:
+            min_edge *= float(getattr(cfg, "ACTIVITY_EDGE_SCALE", 0.70))
 
         # Threshold features (central ranking signal)
         tf = compute_threshold_features(
@@ -529,6 +600,16 @@ class AssetEngine:
         if p_base < self._p_base_min or p_base > self._p_base_max:
             log.debug(f"[{self.spec.symbol}] p_base={p_base} out of valid range [{self._p_base_min},{self._p_base_max}], skipping")
             d = self._wait("structural_model_invalid", yes_price_raw, p_base=p_base, alpha_micro=0.0, spot_now=spot_now, spot_start=spot_start)
+            d.update(_tf_log_fields(tf))
+            return d
+
+        # Skip structurally undecided windows (coin-flip p_base → noisy edge estimates)
+        if abs(p_base - 0.5) < cfg.P_BASE_CENTER_MIN:
+            d = self._wait(
+                f"p_base_near_50({p_base:.3f})",
+                yes_price_raw, p_base=p_base, alpha_micro=0.0,
+                spot_now=spot_now, spot_start=spot_start,
+            )
             d.update(_tf_log_fields(tf))
             return d
 
@@ -606,7 +687,7 @@ class AssetEngine:
                 if e._open_pos is not None
             ]
             gross = self.sim.gross_open_exposure(all_positions)
-            if gross + cfg.MAX_POS_PCT > 0.08:
+            if gross + cfg.MAX_POS_PCT > cfg.PORTFOLIO_GROSS_CAP:
                 return self._wait(f"portfolio_cap({gross:.1%})", yes_price_raw, spot_now=spot_now, spot_start=spot_start)
 
         # Strategy router
@@ -632,15 +713,22 @@ class AssetEngine:
         }
         signal = self.router.route(snapshot)
         if signal.action == "WAIT":
-            # Secondary entry: alpha overlay can drive entries when CWM is low but p_real diverges
+            # Optional secondary path — disabled under higher_sharpe (R8: majority of losing entries)
             p_real_edge = abs(p_real - yes_price_raw)
             lag_conf = self.lag_tracker.lag_confidence
-            if p_real_edge >= cfg.ALPHA_EDGE_MIN and lag_conf >= cfg.ALPHA_EDGE_LAG_MIN:
-                # Allow trade via alpha-edge path (OR with CWM path)
+            if (
+                cfg.ALPHA_EDGE_ENABLED
+                and p_real_edge >= cfg.ALPHA_EDGE_MIN
+                and lag_conf >= cfg.ALPHA_EDGE_LAG_MIN
+            ):
                 action = "BUY_YES" if p_real > yes_price_raw else "BUY_NO"
                 ev = p_real - yes_price_raw
                 signal_strategy = "alpha_edge"
-            elif cfg.ALPHA_EDGE_BAND_LOW <= p_real_edge < cfg.ALPHA_EDGE_MIN and lag_conf >= cfg.ALPHA_EDGE_LAG_MIN:
+            elif (
+                cfg.ALPHA_EDGE_ENABLED
+                and cfg.ALPHA_EDGE_BAND_LOW <= p_real_edge < cfg.ALPHA_EDGE_MIN
+                and lag_conf >= cfg.ALPHA_EDGE_LAG_MIN
+            ):
                 d = self._wait("alpha_edge_insufficient", yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
                 d.update(_tf_log_fields(tf))
                 d["strategy"] = signal.strategy
@@ -670,7 +758,7 @@ class AssetEngine:
 
         # Lag gate: only lag_arb requires detectable Kalshi lag (strategy already checks in lag_arb.py)
         lag_conf = self.lag_tracker.lag_confidence
-        if signal_strategy == "lag_arb" and lag_conf < cfg.LAG_ABSENT_MIN:
+        if signal_strategy == "lag_arb" and lag_conf < lag_absent_min:
             return self._wait(f"lag_absent({lag_conf:.2f})", yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
 
         # Sharpe gate (after enough trades to be meaningful)
@@ -679,16 +767,39 @@ class AssetEngine:
             if self.sim.current_sharpe < cfg.SHARPE_MIN:
                 return self._wait(f"sharpe({self.sim.current_sharpe:.2f}<{cfg.SHARPE_MIN})", yes_price_raw, spot_now=spot_now, spot_start=spot_start)
 
-        # Kelly sizing
+        # Kelly sizing + variance-aware shrink (extreme entries / noisy belief)
         if ev > 0:
             frac   = kelly_binary(p_real, p_market)
             action = "BUY_YES"
+            entry_for_size = p_market
         else:
             frac   = kelly_binary(1.0 - p_real, 1.0 - p_market)
             action = "BUY_NO"
+            entry_for_size = 1.0 - p_market
 
-        frac    *= vol_scalar
-        size_usd = min(self.sim.balance * frac, self.sim.balance * cfg.MAX_POS_PCT)
+        # R12 lesson: all 4 losses were lottery tickets (entry < 0.15)
+        min_entry = getattr(cfg, "MIN_ENTRY_PRICE", 0.0)
+        max_entry = getattr(cfg, "MAX_ENTRY_PRICE", 1.0)
+        if entry_for_size < min_entry:
+            return self._wait(
+                f"entry_too_cheap({entry_for_size:.3f}<{min_entry:.2f})",
+                yes_price_raw, p_base=p_base, alpha_micro=alpha_micro,
+                spot_now=spot_now, spot_start=spot_start,
+            )
+        if entry_for_size > max_entry:
+            return self._wait(
+                f"entry_too_rich({entry_for_size:.3f}>{max_entry:.2f})",
+                yes_price_raw, p_base=p_base, alpha_micro=alpha_micro,
+                spot_now=spot_now, spot_start=spot_start,
+            )
+
+        frac *= vol_scalar
+        frac *= entry_variance_scalar(entry_for_size)
+        frac *= belief_vol_scalar(self.tracker.belief_vol)
+        max_pos = cfg.MAX_POS_PCT
+        if activity_probe:
+            max_pos = min(max_pos, float(getattr(cfg, "ACTIVITY_PROBE_SIZE_PCT", 0.025)))
+        size_usd = min(self.sim.balance * frac, self.sim.balance * max_pos)
         size_usd = max(0.0, size_usd)
 
         ok, reason = self.sim.can_trade(size_usd, abs(ev), min_edge, asset=self.spec.symbol)
@@ -698,7 +809,16 @@ class AssetEngine:
         if size_usd < cfg.MIN_TRADE_USD:
             return self._wait(f"size_too_small(${size_usd:.2f})", yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
 
-        log.warning(f"[{self.spec.symbol}] Pre-trade p_base={p_base:.4f} p_real={p_real:.4f}")
+        if activity_probe:
+            idle_m = self.sim.seconds_since_last_trade() / 60.0
+            log.warning(
+                f"[{self.spec.symbol}] ACTIVITY PROBE idle={idle_m:.0f}m — "
+                f"eased gates, size cap {max_pos:.1%}"
+            )
+        log.warning(
+            f"[{self.spec.symbol}] Pre-trade p_base={p_base:.4f} p_real={p_real:.4f} "
+            f"strategy={signal_strategy} size=${size_usd:.2f} ptb_src={self._price_to_beat_source}"
+        )
         return {
             "action":        action,
             "size_usd":      size_usd,
@@ -708,7 +828,7 @@ class AssetEngine:
             "p_base":        p_base,
             "spot_now":      spot_now,
             "spot_start":    spot_start,
-            "strategy":      signal_strategy,
+            "strategy":      ("activity_probe+" + signal_strategy) if activity_probe else signal_strategy,
             "diagnostics":   signal.diagnostics,
             "raw_features":  raw_features,
             "alpha_micro":   alpha_micro,
@@ -721,6 +841,7 @@ class AssetEngine:
             "bias":          bias,
             "uncertainty":   uncertainty,
             "belief_vol":    self.tracker.belief_vol,
+            "price_to_beat_source": self._price_to_beat_source,
             "time_remaining": self._time_remaining_secs(),
             "reason":        "OK",
         }
@@ -729,8 +850,11 @@ class AssetEngine:
 
     def _execute(self, d: dict, yes_price: float) -> None:
         spot_conf = d.get("spot_confidence")
-        if spot_conf is not None and spot_conf < 0.6:
-            log.warning(f"[{self.spec.symbol}] Aborting order: spot_confidence={spot_conf:.2f} < 0.6 (feed unreliable)")
+        if spot_conf is not None and spot_conf < cfg.SPOT_CONFIDENCE_MIN:
+            log.warning(
+                f"[{self.spec.symbol}] Aborting order: "
+                f"spot_confidence={spot_conf:.2f} < {cfg.SPOT_CONFIDENCE_MIN} (feed unreliable)"
+            )
             return
         p_real = d.get("p_real")
         if p_real is not None and 0.48 <= p_real <= 0.52:
@@ -741,6 +865,14 @@ class AssetEngine:
         entry_price  = yes_price if side == "yes" else (1.0 - yes_price)
         if entry_price < self._p_base_min:
             log.warning(f"[{self.spec.symbol}] Rejecting entry: price={entry_price:.4f} < {self._p_base_min} (min)")
+            return
+        min_entry = getattr(cfg, "MIN_ENTRY_PRICE", 0.0)
+        max_entry = getattr(cfg, "MAX_ENTRY_PRICE", 1.0)
+        if entry_price < min_entry or entry_price > max_entry:
+            log.warning(
+                f"[{self.spec.symbol}] Rejecting entry: price={entry_price:.4f} "
+                f"outside [{min_entry:.2f}, {max_entry:.2f}]"
+            )
             return
         # Kalshi: each contract costs entry_price dollars; you receive $1 on win.
         # contracts = floor(size_usd / entry_price)
@@ -881,6 +1013,7 @@ class AssetEngine:
                 "diagnostics":    d.get("diagnostics"),
                 "raw_features":  d.get("raw_features"),
                 "alpha_micro":   round(d.get("alpha_micro"), 4) if d.get("alpha_micro") is not None else None,
+                "price_to_beat_source": d.get("price_to_beat_source") or self._price_to_beat_source or None,
                 "ev":           d.get("ev"),
                 "bias":         d.get("bias"),
                 "conviction":   d.get("conviction"),
