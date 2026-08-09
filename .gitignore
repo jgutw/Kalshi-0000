@@ -14,3 +14,4 @@ __pycache__/
 venv/
 run_*.txt
 *.xlsx
+!reports/kalshi_rounds.xlsx

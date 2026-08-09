@@ -46,7 +46,24 @@ from .asset_engine import AssetEngine
 from .recorder import EventRecorder
 from .data.coinbase_feed import run_coinbase_microstructure as run_coinbase_microstructure_feed
 from .data.kraken_feed import run_kraken as run_kraken_feed
-from .session_meta import write_session_meta, tag_archived_session, prepare_fresh_round
+from .session_meta import (
+    archive_and_log_round,
+    prepare_fresh_round,
+    tag_archived_session,
+    write_session_meta,
+)
+from .runtime_control import (
+    PROFILE_PRESETS,
+    apply_profile,
+    clear_bot_command_queue,
+    clear_stop,
+    prepare_for_new_round,
+    process_bot_commands,
+    stop_requested,
+    write_bot_heartbeat,
+    write_live_config,
+    write_open_positions,
+)
 
 # Windows UTF-8 fix
 if sys.platform == "win32":
@@ -111,7 +128,29 @@ class KalshiMultiBot:
         for engine in self.engines.values():
             engine._all_engines = self.engines
 
+        self._shutdown = False
         log.info(f"Enabled assets: {list(self.engines.keys())}")
+
+    def _snapshot_open_positions(self) -> None:
+        rows = []
+        for sym, engine in self.engines.items():
+            pos = engine._open_pos
+            if pos is None:
+                continue
+            rows.append(
+                {
+                    "asset": sym,
+                    "ticker": pos.market_ticker,
+                    "side": pos.side,
+                    "entry": pos.entry_price,
+                    "contracts": pos.contracts,
+                    "amount_usdc": pos.amount_usdc,
+                    "window_id": pos.window_id,
+                    "price_to_beat": pos.price_to_beat,
+                    "entered_at": pos.entered_at,
+                }
+            )
+        write_open_positions(rows)
 
     # ─── Startup ──────────────────────────────────────────────────────────────
 
@@ -459,6 +498,8 @@ class KalshiMultiBot:
         while True:
             await asyncio.sleep(120)
             self.print_status()
+            self._snapshot_open_positions()
+            write_live_config()
             self.sim.save()
 
     async def vault_poll(self) -> None:
@@ -471,6 +512,49 @@ class KalshiMultiBot:
                     self.sim.save()
             except Exception as e:
                 log.warning("vault_poll failed: %s", e)
+
+    async def control_poll(self) -> None:
+        """Apply Telegram runtime commands (pause/resume/sizing/stop)."""
+        while not self._shutdown:
+            await asyncio.sleep(2)
+            try:
+                write_bot_heartbeat(
+                    {
+                        "balance": self.sim.balance,
+                        "vault": self.sim.vault_balance,
+                        "equity": self.sim.total_equity,
+                    }
+                )
+                process_bot_commands()
+                self._snapshot_open_positions()
+                if stop_requested():
+                    log.warning(
+                        "Stop requested via runtime control (Telegram) — "
+                        "archiving + Excel, then shutting down"
+                    )
+                    self._shutdown = True
+                    try:
+                        self._snapshot_open_positions()
+                        write_live_config()
+                        self.sim.save()
+                        # Bridge already archives when bot is down; when bot is up,
+                        # archive here and mark notice so Telegram gets one confirmation.
+                        notice = archive_and_log_round(source="telegram_stop_bot")
+                        log.info(
+                            "Telegram /stop archived %s excel=%s",
+                            notice.get("archive_dir"),
+                            notice.get("excel_path"),
+                        )
+                    except Exception as e:
+                        log.error("Telegram /stop archive failed: %s", e)
+                    # Cancel sibling tasks so asyncio.run() can exit cleanly
+                    current = asyncio.current_task()
+                    for task in asyncio.all_tasks():
+                        if task is not current and not task.done():
+                            task.cancel()
+                    return
+            except Exception as e:
+                log.warning("control_poll failed: %s", e)
 
     # ─── Venue warmup check ────────────────────────────────────────────────────
 
@@ -487,6 +571,13 @@ class KalshiMultiBot:
     async def run(self) -> None:
         self.print_status()
         log.info("Starting Kalshi multi-asset bot...")
+        # Ignore stale Telegram /stop (flag + queued commands) from a prior session
+        prepare_for_new_round(source="bot_start")
+        clear_stop(source="bot_start")
+        clear_bot_command_queue()
+        self._shutdown = False
+        write_live_config()
+        self._snapshot_open_positions()
 
         self._verify_series()
 
@@ -506,10 +597,18 @@ class KalshiMultiBot:
 
         tasks.append(self.heartbeat())
         tasks.append(self.vault_poll())
+        tasks.append(self.control_poll())
         tasks.append(self.recorder.run())
         tasks.append(self._warmup_check())
 
-        await asyncio.gather(*tasks)
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            log.info("Bot tasks cancelled (shutdown).")
+        finally:
+            clear_stop(source="bot_exit")
+            self._snapshot_open_positions()
+            self.sim.save()
 
     # ─── Scan mode ────────────────────────────────────────────────────────────
 
@@ -551,7 +650,7 @@ def main() -> None:
     parser.add_argument("--debug",    action="store_true",  help="Enable DEBUG logging (orderbook, etc.)")
     parser.add_argument(
         "--session-tag",
-        default="round_14_disciplined_paper_v2",
+        default="round_21_max_risk_paper",
         help="Label for logs/session_meta.json (run mode only)",
     )
     parser.add_argument(
@@ -565,6 +664,12 @@ def main() -> None:
         default=None,
         help="Paper starting capital (e.g. 500). Applied before --fresh-round.",
     )
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default=None,
+        help=f"Apply sizing preset: {', '.join(PROFILE_PRESETS)}",
+    )
     args = parser.parse_args()
 
     if args.debug:
@@ -573,6 +678,11 @@ def main() -> None:
     if args.live:
         cfg.DRY_RUN = False
         log.warning("⚠  LIVE MODE — real money")
+    if args.profile:
+        ok, msg = apply_profile(args.profile)
+        if not ok:
+            raise SystemExit(msg)
+        log.info("Profile applied: %s", msg)
     if args.kelly:
         cfg.KELLY_FRACTION = args.kelly
     if args.min_edge:

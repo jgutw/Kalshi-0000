@@ -34,6 +34,9 @@ ARCHIVE_LOG_FILES = (
     "near_misses.csv",
     "vault_config.json",
     "vault_skims.jsonl",
+    "runtime_control.json",
+    "live_config.json",
+    "open_positions.json",
 )
 
 
@@ -111,12 +114,21 @@ def _config_levels() -> dict[str, Any]:
         "assets_enabled": [a.symbol for a in ASSETS if a.enabled],
         "optimizations": {
             "XRP_disabled": not any(a.symbol == "XRP" and a.enabled for a in ASSETS),
-            "note": (
-                "disciplined_paper_v2: entry band [MIN,MAX], equity DD halt, "
-                "vault reduces peak_balance on skim, 1h activity mandate — PAPER ONLY"
-            ),
+            "MIN_TRADE_USD": cfg.MIN_TRADE_USD,
+            "PORTFOLIO_GROSS_CAP": cfg.PORTFOLIO_GROSS_CAP,
+            "note": _profile_note(),
         },
     }
+
+
+def _profile_note() -> str:
+    base = (
+        f"{cfg.CONFIG_PROFILE}: loose gates, large Kelly/MAX_POS, variance shrink off, "
+        "lottery entries allowed — PAPER ONLY (not for live)"
+    )
+    if cfg.CONFIG_PROFILE == "max_risk_micro":
+        return base + "; sized for $100–$300 starting capital"
+    return base
 
 
 def _archive_summary(archive_dir: Path) -> dict[str, Any]:
@@ -158,6 +170,7 @@ def write_session_meta(
 
     meta = {
         "session_tag": session_tag,
+        "active": True,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "starting_balance": cfg.SIM_BALANCE,
         "config_levels": _config_levels(),
@@ -183,6 +196,15 @@ def archive_current_logs(session_tag: str) -> Path:
     Copy logs/* into sessions/session_YYYY-MM-DD_HHMM/ and tag the archive.
     Returns the archive directory (even if logs were empty).
     """
+    archive_dir, _excel = archive_current_logs_with_excel(session_tag)
+    return archive_dir
+
+
+def archive_current_logs_with_excel(session_tag: str) -> tuple[Path, Optional[Path]]:
+    """
+    Archive logs and update rounds Excel.
+    Returns (archive_dir, excel_path_or_None).
+    """
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
     archive_dir = SESSIONS_DIR / f"session_{stamp}"
@@ -195,13 +217,20 @@ def archive_current_logs(session_tag: str) -> Path:
             shutil.copy2(src, archive_dir / name)
             copied += 1
 
+    excel_path: Optional[Path] = None
     if copied:
         tag_archived_session(archive_dir, session_tag)
         log.info("Archived %d log file(s) → %s", copied, archive_dir)
+        try:
+            from .rounds_excel import record_archived_round
+
+            excel_path = record_archived_round(archive_dir)
+        except Exception as e:
+            log.warning("Rounds Excel update skipped: %s", e)
     else:
         log.info("No log files to archive under %s", LOGS_DIR)
 
-    return archive_dir
+    return archive_dir, excel_path
 
 
 def reset_logs_for_fresh_round() -> None:
@@ -231,6 +260,135 @@ def prepare_fresh_round(archive_tag: str) -> Path:
     archive_dir = archive_current_logs(archive_tag)
     reset_logs_for_fresh_round()
     return archive_dir
+
+
+def current_session_tag(default: str = "session") -> str:
+    """Read live logs/session_meta.json tag, if present."""
+    if not META_PATH.exists():
+        return default
+    try:
+        meta = json.loads(META_PATH.read_text(encoding="utf-8"))
+        tag = str(meta.get("session_tag") or "").strip()
+        return tag or default
+    except (json.JSONDecodeError, OSError):
+        return default
+
+
+def archive_tag_for_session(session_tag: str) -> str:
+    if session_tag.startswith("round_"):
+        return "archive_" + session_tag[len("round_") :]
+    if session_tag.startswith("archive_"):
+        return session_tag
+    return f"archive_{session_tag}"
+
+
+def session_is_active() -> bool:
+    """True when a paper/live round is in progress (bot started and not stopped)."""
+    try:
+        from .runtime_control import trading_bot_running
+
+        if trading_bot_running():
+            return True
+    except Exception:
+        pass
+    if not META_PATH.exists():
+        return False
+    try:
+        meta = json.loads(META_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+    if meta.get("active") is False:
+        return False
+    if str(meta.get("session_tag") or "") == "idle":
+        return False
+    # Legacy metas without active flag: treat as inactive once stopped to idle.
+    return bool(meta.get("active", False))
+
+
+def mark_session_idle(last_archive: Optional[str] = None) -> None:
+    """
+    Clear live trading artifacts after /stop so Telegram /status shows no active round.
+    Archives are preserved under sessions/.
+    """
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    for name in (
+        "kalshi_trades.jsonl",
+        "kalshi_decisions.jsonl",
+        "kalshi_events.jsonl",
+        "kalshi_features.jsonl",
+        "near_misses.csv",
+        "kalshi_sim.json",
+        "open_positions.json",
+        "live_config.json",
+        "bot_heartbeat.json",
+    ):
+        path = LOGS_DIR / name
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError as e:
+                log.warning("idle cleanup %s failed: %s", name, e)
+
+    meta = {
+        "session_tag": "idle",
+        "active": False,
+        "stopped_at": datetime.now(timezone.utc).isoformat(),
+        "last_archive": last_archive,
+        "note": "No active paper round. Start with run_kalshi_bot.py --mode run --fresh-round",
+    }
+    META_PATH.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    log.info("Session marked idle (no active paper round)")
+
+
+def archive_and_log_round(
+    session_tag: Optional[str] = None,
+    source: str = "telegram_stop",
+    emit_telegram_notice: bool = True,
+    mark_idle: bool = True,
+) -> dict[str, Any]:
+    """
+    Archive current logs and update rounds Excel (used by Telegram /stop).
+    By default clears live logs afterward so /status shows idle.
+    """
+    tag = archive_tag_for_session(session_tag or current_session_tag())
+    archive_dir, excel_path = archive_current_logs_with_excel(tag)
+    summary = _archive_summary(archive_dir)
+    excel_rel = None
+    if excel_path is not None:
+        try:
+            excel_rel = str(excel_path.resolve().relative_to(PROJECT_ROOT))
+        except ValueError:
+            excel_rel = str(excel_path)
+    notice = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": "round_archived",
+        "source": source,
+        "session_tag": tag,
+        "archive_dir": str(archive_dir.relative_to(PROJECT_ROOT)),
+        "summary": summary,
+        "excel_path": excel_rel,
+        "excel_ok": excel_path is not None,
+    }
+    if excel_path is not None and "kalshi_rounds_update_" in Path(excel_rel or "").name:
+        notice["excel_note"] = "main workbook locked; wrote sidecar"
+
+    if emit_telegram_notice:
+        notices = LOGS_DIR / "telegram_notices.jsonl"
+        try:
+            with open(notices, "a", encoding="utf-8") as f:
+                f.write(json.dumps(notice) + "\n")
+        except OSError as e:
+            log.warning("telegram notice write failed: %s", e)
+
+    if mark_idle:
+        mark_session_idle(last_archive=str(archive_dir.relative_to(PROJECT_ROOT)))
+
+    log.info(
+        "Stop-archive complete → %s | excel=%s",
+        archive_dir,
+        notice.get("excel_path"),
+    )
+    return notice
 
 
 def tag_archived_session(archive_dir: Path, session_tag: str) -> None:

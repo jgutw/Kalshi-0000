@@ -460,6 +460,14 @@ class AssetEngine:
     # ─── Decision ─────────────────────────────────────────────────────────────
 
     def make_decision(self, yes_price_raw: float) -> dict:
+        # Telegram / dashboard pause — block new entries only
+        try:
+            from .runtime_control import entries_paused
+            if entries_paused():
+                return self._wait("telegram_paused", yes_price_raw)
+        except Exception:
+            pass
+
         # Circuit breaker
         halted, halt_reason = self.sim.is_halted(self.spec.symbol)
         if halted:

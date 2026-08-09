@@ -40,57 +40,57 @@ ASSETS: List[AssetSpec] = [
 
 @dataclass
 class TradingConfig:
-    # R14: equity-based DD, vault-aware peaks, hourly activity mandate.
-    # Do NOT use live without further fill/settlement hardening.
-    CONFIG_PROFILE: str         = "disciplined_paper_v2"
+    # PAPER-ONLY aggressive profile: maximize fire rate + size. Do NOT use live.
+    # Classic max_risk_paper (same spirit as R11/R12/R19).
+    CONFIG_PROFILE: str         = "max_risk_paper"
 
-    # Kelly / position sizing — moderate (R12 half-size cut DD ~half)
-    KELLY_FRACTION: float       = 0.22
-    MIN_EDGE_PCT: float         = 0.015
-    MAX_POS_PCT: float          = 0.05      # 5% bankroll per trade
-    PORTFOLIO_GROSS_CAP: float  = 0.15      # ~3 concurrent max-size names
+    # Kelly / position sizing — large bets
+    KELLY_FRACTION: float       = 0.50
+    MIN_EDGE_PCT: float         = 0.010
+    MAX_POS_PCT: float          = 0.08      # 8% of bankroll per trade
+    PORTFOLIO_GROSS_CAP: float  = 0.30      # allow up to ~3 concurrent max-size positions
     MIN_TRADE_USD: float        = 5.0
 
-    # Circuit breaker
-    MAX_CONSEC_LOSSES: int      = 5
-    COOLDOWN_MINUTES: float     = 15.0
+    # Circuit breaker — rarely pause
+    MAX_CONSEC_LOSSES: int      = 8
+    COOLDOWN_MINUTES: float     = 10.0
     PER_ASSET_CIRCUIT_BREAKER: bool = True
-    MAX_DAILY_LOSS_PCT: float   = 0.20
-    # Peak-to-trough on EQUITY (trading + vault); halt when breached
-    MAX_DRAWDOWN_PCT: float     = 0.25
+    MAX_DAILY_LOSS_PCT: float   = 0.40      # allow deep drawdown in paper
+    # Soft DD halt kept (equity-based) so vault skims don't fake-freeze; high threshold
+    MAX_DRAWDOWN_PCT: float     = 0.50
     DRAWDOWN_HALT_ENABLED: bool = True
-    DRAWDOWN_USE_EQUITY: bool   = True      # R13 fix: don't freeze on vault skims
+    DRAWDOWN_USE_EQUITY: bool   = True
     DAILY_RESET_HOUR_UTC: int   = 0
 
-    # If no closed trade for this long, ease soft gates + smaller probe size
-    ACTIVITY_MANDATE_ENABLED: bool = True
-    ACTIVITY_IDLE_SECS: float      = 3600.0   # ~1 hour
-    ACTIVITY_PROBE_SIZE_PCT: float = 0.025    # 2.5% book when probing
-    ACTIVITY_EDGE_SCALE: float     = 0.70     # min edge × this when idle
-    ACTIVITY_SPOT_CONF_FLOOR: float = 0.30    # allow thinner venue coverage when idle
+    # Activity mandate OFF — classic max_risk does not force probe trades
+    ACTIVITY_MANDATE_ENABLED: bool = False
+    ACTIVITY_IDLE_SECS: float      = 3600.0
+    ACTIVITY_PROBE_SIZE_PCT: float = 0.025
+    ACTIVITY_EDGE_SCALE: float     = 0.70
+    ACTIVITY_SPOT_CONF_FLOOR: float = 0.30
     ACTIVITY_LAG_SCALE: float      = 0.70
 
-    # Entry gates — R12: 4/4 losses were entry < 0.15; skipping them = +$40 only
-    MIN_ENTRY_PRICE: float      = 0.15      # hard reject lottery YES/NO
-    MAX_ENTRY_PRICE: float      = 0.85      # hard reject expensive favorites
-    LAG_CONFIDENCE_MIN: float   = 0.18
-    LAG_ABSENT_MIN: float       = 0.12
-    CWM_MIN: float              = 0.020
+    # Entry gates — loose (lottery tickets allowed, as in R11/R12)
+    MIN_ENTRY_PRICE: float      = 0.02
+    MAX_ENTRY_PRICE: float      = 0.98
+    LAG_CONFIDENCE_MIN: float   = 0.12
+    LAG_ABSENT_MIN: float       = 0.08
+    CWM_MIN: float              = 0.015
     ALPHA_EDGE_ENABLED: bool    = True
-    ALPHA_EDGE_MIN: float       = 0.05
-    ALPHA_EDGE_BAND_LOW: float  = 0.03
-    ALPHA_EDGE_LAG_MIN: float   = 0.18
+    ALPHA_EDGE_MIN: float       = 0.04
+    ALPHA_EDGE_BAND_LOW: float  = 0.02
+    ALPHA_EDGE_LAG_MIN: float   = 0.15
     MIN_CONVICTION: int         = 2
-    P_BASE_CENTER_MIN: float    = 0.03
+    P_BASE_CENTER_MIN: float    = 0.02
     SHARPE_MIN: float           = -99.0
     SHARPE_MIN_TRADES: int      = 10_000
 
-    # Volatility
-    VOL_HI: float               = 5.00
-    VOL_MID: float              = 2.50
+    # Volatility — almost never hard-block
+    VOL_HI: float               = 8.00
+    VOL_MID: float              = 4.00
 
-    # Spot feed
-    SPOT_CONFIDENCE_MIN: float  = 0.45
+    # Spot feed — allow thinner venue coverage
+    SPOT_CONFIDENCE_MIN: float  = 0.30
 
     # Early exit OFF — ride binary 0/1
     EARLY_EXIT_ENABLED: bool            = False
@@ -102,34 +102,35 @@ class TradingConfig:
 
     MIN_STRUCTURAL_VOL: float   = 0.15
 
-    # Structural band (still allow wide markets, but size/entry floors gate risk)
-    P_BASE_MIN: float           = 0.05
-    P_BASE_MAX: float           = 0.95
+    # Wider structural acceptance
+    P_BASE_MIN: float           = 0.02
+    P_BASE_MAX: float           = 0.98
 
     HAWKES_DECAY: float         = 0.046
     HAWKES_ALPHA: float         = 0.8
     OFI_WINDOW_SECS: int        = 120
     LOGIT_EWM_ALPHA: float      = 0.15
 
+    # Trade almost the whole window
     WINDOW_SECS: int            = 900
-    SKIP_OPEN_SECS: int         = 20
-    SKIP_CLOSE_SECS: int        = 30
+    SKIP_OPEN_SECS: int         = 10
+    SKIP_CLOSE_SECS: int        = 15
     PTB_CAPTURE_SECS: float     = 120.0
 
     PRICE_MAX_AGE_SECS: float   = 60.0
 
-    # Variance sizing — shrink when price is far from 0.50
-    ENTRY_VAR_MILD_DIST: float  = 0.20      # |p-0.5| > 0.20 → mild shrink
-    ENTRY_VAR_HARD_DIST: float  = 0.30      # |p-0.5| > 0.30 → hard shrink
-    ENTRY_VAR_MILD_SCALE: float = 0.65
-    ENTRY_VAR_HARD_SCALE: float = 0.40
-    BELIEF_VOL_MILD: float      = 0.06
-    BELIEF_VOL_HARD: float      = 0.12
-    BELIEF_VOL_MILD_SCALE: float = 0.70
-    BELIEF_VOL_HARD_SCALE: float = 0.40
+    # Variance sizing — do NOT shrink lottery entries in this profile
+    ENTRY_VAR_MILD_DIST: float  = 0.49
+    ENTRY_VAR_HARD_DIST: float  = 0.50
+    ENTRY_VAR_MILD_SCALE: float = 1.0
+    ENTRY_VAR_HARD_SCALE: float = 1.0
+    BELIEF_VOL_MILD: float      = 1.0
+    BELIEF_VOL_HARD: float      = 1.0
+    BELIEF_VOL_MILD_SCALE: float = 1.0
+    BELIEF_VOL_HARD_SCALE: float = 1.0
 
     # Simulation
-    SIM_BALANCE: float          = 1000.0
+    SIM_BALANCE: float          = 2000.0
     SIM_FILE: str               = "logs/kalshi_sim.json"
     DRY_RUN: bool               = True
 
