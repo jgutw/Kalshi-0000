@@ -28,6 +28,33 @@ from .config import cfg
 log = logging.getLogger("sim_state")
 TRADE_LOG = "logs/kalshi_trades.jsonl"
 
+# C7 instrumentation: entry-time fields copied onto each closed-trade row.
+# Chosen so loss attribution (strategy / edge / crowding / sizing) needs only
+# kalshi_trades.jsonl — the decisions log is too sparse to join reliably.
+DECISION_SNAPSHOT_FIELDS = (
+    "strategy", "ev", "p_real", "p_base", "p_market",
+    "confidence_weighted_mispricing", "lag_confidence", "spot_confidence",
+    "conviction", "belief_vol", "alpha_micro", "z_threshold",
+    "time_remaining", "realized_vol", "min_edge",
+    "entry_for_size", "is_lottery",
+    "portfolio_gross_at_entry", "concurrent_open",
+    "size_usd", "price_to_beat_source",
+)
+
+
+def _decision_snapshot(decision: dict) -> dict:
+    """Flat, JSON-safe subset of the entry decision."""
+    out: dict = {}
+    for key in DECISION_SNAPSHOT_FIELDS:
+        val = decision.get(key)
+        if val is None:
+            continue
+        if isinstance(val, (str, bool, int)):
+            out[key] = val
+        elif isinstance(val, float):
+            out[key] = round(val, 6)
+    return out
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Open position
@@ -45,6 +72,10 @@ class OpenPosition:
     amount_usdc:    float    # dollars committed
     entered_at:     float    # unix timestamp
     price_to_beat:  Optional[float]   # exchange price at window open
+    fees_usdc:      float = 0.0
+    order_id:       str = ""
+    is_lottery:     bool = False      # entry < LOTTERY_ENTRY_MAX (sleeve accounting)
+    decision:       Optional[dict] = None   # C7 entry snapshot, copied onto the trade row
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -102,6 +133,11 @@ class SimState:
     last_trade_ts: float = 0.0   # unix time of last closed trade (0 = none yet)
     session_started_ts: float = field(default_factory=time.time)
 
+    # Live guard mirrors (Kalshi is source of truth when DRY_RUN=False)
+    live_halt_reason: str = ""
+    kalshi_available: float = 0.0
+    kalshi_portfolio_value: float = 0.0
+
     # ─── Properties ───────────────────────────────────────────────────────────
 
     @property
@@ -125,7 +161,10 @@ class SimState:
 
     @property
     def total_equity(self) -> float:
-        """Trading balance + vault (full paper economic equity)."""
+        """
+        Trading balance + vault. In live, LiveGuard reserves the vault out of
+        balance, so this stays equal to Kalshi cash instead of double-counting.
+        """
         return float(self.balance) + float(self.vault_balance)
 
     @property
@@ -171,9 +210,21 @@ class SimState:
             self.peak_equity = eq
 
     def gross_open_exposure(self, open_positions: List[OpenPosition]) -> float:
-        """Sum of all open position sizes as fraction of balance."""
+        """Sum of all open position sizes as fraction of working capital."""
         total = sum(p.amount_usdc for p in open_positions)
+        if not cfg.DRY_RUN:
+            # Live: balance is Kalshi *available*; include open premium in denominator
+            return total / max(float(self.balance) + total, 1.0)
         return total / max(self.balance, 1.0)
+
+    def set_live_halt(self, reason: str) -> None:
+        self.live_halt_reason = str(reason or "live_halt")
+        log.error("LIVE HALT: %s", self.live_halt_reason)
+
+    def clear_live_halt(self) -> None:
+        if self.live_halt_reason:
+            log.info("LIVE HALT cleared (was: %s)", self.live_halt_reason)
+        self.live_halt_reason = ""
 
     # ─── Circuit breaker ──────────────────────────────────────────────────────
 
@@ -185,6 +236,10 @@ class SimState:
         When PER_ASSET_CIRCUIT_BREAKER and asset is set, only that asset's streak applies.
         """
         self._maybe_reset_daily()
+        if not cfg.DRY_RUN and self.live_halt_reason:
+            return True, self.live_halt_reason
+        if not cfg.DRY_RUN and float(self.balance) < float(getattr(cfg, "LIVE_MIN_AVAILABLE_USD", 2.0)):
+            return True, f"live_available_too_low(${self.balance:.2f})"
         if self.daily_dd >= cfg.MAX_DAILY_LOSS_PCT:
             return True, f"daily_loss {self.daily_dd:.1%}"
         if (
@@ -218,6 +273,17 @@ class SimState:
         if self.consec_losses >= cfg.MAX_CONSEC_LOSSES:
             if self._halted_at is None:
                 self._halted_at = time.time()
+            if not cfg.DRY_RUN and getattr(cfg, "LIVE_BREAKER_MANUAL_RESUME", True):
+                # Live: no timed resume. A cooldown would put real money back
+                # into whatever regime produced the streak. Sticky via
+                # live_halt_reason, cleared only by clear_breaker_halt().
+                reason = (
+                    f"consec_losses({self.consec_losses}>={cfg.MAX_CONSEC_LOSSES}) "
+                    "— send /resume after reviewing"
+                )
+                if self.live_halt_reason != reason:
+                    self.set_live_halt(reason)
+                return True, reason
             elapsed = time.time() - self._halted_at
             cooldown = cfg.COOLDOWN_MINUTES * 60
             if elapsed < cooldown:
@@ -228,6 +294,35 @@ class SimState:
             self._halted_at = None
 
         return False, ""
+
+    def clear_breaker_halt(self, source: str = "operator") -> str:
+        """
+        Operator reset of the consecutive-loss breaker. Returns a description of
+        what was cleared, or "" if nothing was tripped.
+
+        Only touches breaker state: a divergence or balance halt raised by
+        LiveGuard stays put, because those are not the operator's to wave off.
+        """
+        cleared: list[str] = []
+        if self.consec_losses:
+            cleared.append(f"streak {self.consec_losses}")
+        if self._halted_at is not None:
+            cleared.append("global cooldown")
+        benched = [a for a in self._halted_at_by_asset]
+        if benched:
+            cleared.append("benched " + ",".join(sorted(benched)))
+        if (self.live_halt_reason or "").startswith("consec_losses"):
+            cleared.append("live halt")
+            self.live_halt_reason = ""
+
+        self.consec_losses = 0
+        self._halted_at = None
+        self.consec_losses_by_asset = {}
+        self._halted_at_by_asset = {}
+
+        if cleared:
+            log.warning("Circuit breaker reset by %s: %s", source, "; ".join(cleared))
+        return "; ".join(cleared)
 
     def _maybe_reset_daily(self) -> None:
         """Reset daily loss counter at UTC midnight."""
@@ -262,11 +357,16 @@ class SimState:
         price_to_beat: Optional[float] = None,
         exit_spot: Optional[float] = None,
         side: Optional[str] = None,
+        fees: float = 0.0,
+        skip_balance_apply: bool = False,
+        decision: Optional[dict] = None,
     ) -> float:
         """Record a closed trade. Returns P&L."""
-        # Kalshi: each contract costs entry_price cents, pays $1 on win.
-        # P&L = (exit_price - entry_price) × contracts.
-        pnl = (exit_ - entry) * contracts
+        # Kalshi: each contract costs entry_price, pays $1 on win.
+        # P&L = (exit_price - entry_price) × contracts - fees.
+        fee_amt = max(0.0, float(fees or 0.0))
+        pnl = (exit_ - entry) * contracts - fee_amt
+        amount_usdc = round(float(entry) * int(contracts), 4)
         trade = {
             "ts":       datetime.now().isoformat(),
             "ticker":   ticker,
@@ -274,16 +374,28 @@ class SimState:
             "entry":    round(entry, 4),
             "exit":     round(exit_, 4),
             "contracts": contracts,
+            "amount_usdc": amount_usdc,  # premium risked at entry
+            "fees":     round(fee_amt, 4),
             "pnl":      round(pnl, 4),
             "strategy": strategy,
             "window_id": window_id,
             "price_to_beat": price_to_beat,
             "exit_spot": exit_spot,
             "side":     side,
+            "live":     (not cfg.DRY_RUN),
         }
+        # C7: attach the entry-time decision context so every closed trade can be
+        # attributed offline without joining against kalshi_decisions.jsonl.
+        if decision and getattr(cfg, "DECISION_SNAPSHOT_ENABLED", True):
+            trade["decision"] = _decision_snapshot(decision)
         self.trades.append(trade)
         self.total_trades += 1
-        self.balance += pnl
+        # Live mode: bankroll is re-synced from Kalshi; don't double-apply local PnL.
+        if not skip_balance_apply and cfg.DRY_RUN:
+            self.balance += pnl
+        elif not skip_balance_apply and not cfg.DRY_RUN:
+            # Still apply locally then sync will overwrite from Kalshi shortly
+            self.balance += pnl
 
         # Binary: exit 1.0 = win, exit 0.0 = loss (explicit check; pnl can have float quirks)
         won = exit_ >= 0.5
@@ -300,9 +412,11 @@ class SimState:
             self.consec_losses_by_asset[asset] = asset_streak
             if self.consec_losses >= cfg.MAX_CONSEC_LOSSES and self._halted_at is None:
                 self._halted_at = time.time()
+                manual = not cfg.DRY_RUN and getattr(cfg, "LIVE_BREAKER_MANUAL_RESUME", True)
                 log.warning(
                     f"Circuit breaker: {self.consec_losses} consecutive losses — "
-                    f"cooldown {cfg.COOLDOWN_MINUTES:.0f}m"
+                    + ("entries stay halted until /resume" if manual
+                       else f"cooldown {cfg.COOLDOWN_MINUTES:.0f}m")
                 )
             if (
                 cfg.PER_ASSET_CIRCUIT_BREAKER
@@ -476,6 +590,9 @@ class SimState:
                     "total_equity":     self.total_equity,
                     "last_trade_ts":    self.last_trade_ts,
                     "session_started_ts": self.session_started_ts,
+                    "live_halt_reason": self.live_halt_reason,
+                    "kalshi_available": self.kalshi_available,
+                    "kalshi_portfolio_value": self.kalshi_portfolio_value,
                     "returns_hist":     self.returns_hist[-500:],
                     "trades":           self.trades[-100:],
                     "asset_stats":      asset_stats_raw,
@@ -509,6 +626,9 @@ class SimState:
             s.peak_equity      = float(d.get("peak_equity", s.balance + s.vault_balance) or (s.balance + s.vault_balance))
             s.last_trade_ts    = float(d.get("last_trade_ts", 0.0) or 0.0)
             s.session_started_ts = float(d.get("session_started_ts", time.time()) or time.time())
+            s.live_halt_reason = str(d.get("live_halt_reason") or "")
+            s.kalshi_available = float(d.get("kalshi_available") or 0.0)
+            s.kalshi_portfolio_value = float(d.get("kalshi_portfolio_value") or 0.0)
             s.returns_hist     = d.get("returns_hist",     [])
             s.trades           = d.get("trades",           [])
             # Restore per-asset stats

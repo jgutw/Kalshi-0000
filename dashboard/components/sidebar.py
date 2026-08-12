@@ -1,10 +1,10 @@
 """
 dashboard/components/sidebar.py — Shared sidebar for all pages.
+
+Kept light for latency: portfolio strip + refresh only (no per-asset list).
 """
 
 from __future__ import annotations
-
-import time
 
 import streamlit as st
 
@@ -12,17 +12,16 @@ from ..data.state_store import StateStore
 from .vault_panel import render_vault_panel
 
 
-def render_sidebar() -> bool:
+def render_sidebar(refresh_secs: int = 5) -> bool:
     """
     Render sidebar. Returns auto_refresh setting.
-    Call at top of each page.
     """
     store = StateStore()
 
     with st.sidebar:
         if store.is_mock_mode():
             st.markdown(
-                '<div class="mock-banner">⚠️ <b>MOCK MODE</b> — no live logs detected</div>',
+                '<div class="mock-banner">⚠️ <b>MOCK MODE</b> — no live logs</div>',
                 unsafe_allow_html=True,
             )
             st.divider()
@@ -32,11 +31,9 @@ def render_sidebar() -> bool:
         total_pnl = equity - portfolio.starting_balance
         pnl_pct = (total_pnl / portfolio.starting_balance * 100) if portfolio.starting_balance else 0
 
-        st.metric("Trading", f"${portfolio.balance:,.2f}")
-        st.metric("Vault", f"${portfolio.vault_balance:,.2f}")
         st.metric("Equity", f"${equity:,.2f}", f"{pnl_pct:+.1f}%")
-        st.metric("Win Rate", f"{portfolio.win_rate:.1%}", None)
-        st.metric("Sharpe", f"{portfolio.sharpe:.2f}", None)
+        st.caption(f"Trading ${portfolio.balance:,.0f} · Vault ${portfolio.vault_balance:,.0f}")
+        st.caption(f"WR {portfolio.win_rate:.0%} · Sharpe {portfolio.sharpe:.2f}")
 
         if portfolio.halt_state:
             st.markdown(
@@ -44,31 +41,14 @@ def render_sidebar() -> bool:
                 unsafe_allow_html=True,
             )
         else:
-            st.success("OK")
+            st.success("Running OK" if not store.is_mock_mode() else "Mock OK")
 
-        st.divider()
-        st.markdown("**Per-asset status**")
-        snapshots = store.get_latest_snapshots()
-        for asset in ["BTC", "ETH", "SOL", "XRP"]:
-            s = snapshots.get(asset)
-            if s:
-                conf = s.synthetic_confidence
-                halted = s.halt_state
-                consec = portfolio.consec_losses
-                if halted or conf < 0.3:
-                    st.markdown(f"🔴 {asset}")
-                elif conf < 0.6 or consec >= 2:
-                    st.markdown(f"🟡 {asset}")
-                else:
-                    st.markdown(f"🟢 {asset}")
-            else:
-                st.markdown(f"⚪ {asset}")
-
-        render_vault_panel()
+        with st.expander("Vault / Take cash", expanded=False):
+            render_vault_panel()
 
         st.divider()
         auto_refresh = st.toggle("Auto-refresh", value=True)
         if auto_refresh:
-            st.caption("Refreshing every 5s")
+            st.caption(f"Every {refresh_secs}s")
 
     return auto_refresh

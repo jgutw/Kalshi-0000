@@ -22,12 +22,17 @@ KRAKEN_WS = "wss://ws.kraken.com/v2"
 # symbol → mid price (shared across all connections)
 kraken_mids: Dict[str, float] = {}
 
-# symbol → Kraken pair
+# symbol → Kraken WS v2 pair (DOGE is XDG on Kraken)
 SYMBOL_TO_PAIR = {
-    "BTC": "BTC/USD",
-    "ETH": "ETH/USD",
-    "SOL": "SOL/USD",
-    "XRP": "XRP/USD",
+    "BTC":  "BTC/USD",
+    "ETH":  "ETH/USD",
+    "SOL":  "SOL/USD",
+    "XRP":  "XRP/USD",
+    "DOGE": "XDG/USD",
+    "BNB":  "BNB/USD",
+    "HYPE": "HYPE/USD",
+    "NEAR": "NEAR/USD",
+    "ZEC":  "ZEC/USD",
 }
 
 

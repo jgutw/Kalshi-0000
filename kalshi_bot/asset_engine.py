@@ -39,6 +39,8 @@ from .signal_engine import (
     AssetSignalEngine, LogitPriceTracker,
     vol_position_scalar, kelly_binary,
     entry_variance_scalar, belief_vol_scalar,
+    side_size_scalar, mid_band_size_scalar,
+    is_lottery_entry, lottery_size_cap_usd,
     sigmoid, logit,
 )
 from .sim_state import SimState, OpenPosition
@@ -52,6 +54,7 @@ log = logging.getLogger("asset_engine")
 # Absolute path so decisions write to project logs/ regardless of cwd
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DECISION_LOG = str(_PROJECT_ROOT / "logs" / "kalshi_decisions.jsonl")
+WINDOW_LOG = str(_PROJECT_ROOT / "logs" / "kalshi_windows.jsonl")
 
 
 def _tf_log_fields(tf) -> dict:
@@ -64,6 +67,18 @@ def _tf_log_fields(tf) -> dict:
         "spot_confidence": tf.spot_confidence,
         "lag_confidence": tf.lag_confidence,
     }
+
+
+def _round_spot(x: Optional[float]) -> Optional[float]:
+    """Log spots with enough decimals for micro-priced alts (DOGE, etc.)."""
+    if x is None:
+        return None
+    ax = abs(float(x))
+    if ax >= 1000:
+        return round(float(x), 2)
+    if ax >= 1:
+        return round(float(x), 4)
+    return round(float(x), 6)
 
 
 def _floor_strike_from_market(market: Optional[dict]) -> Optional[float]:
@@ -160,6 +175,8 @@ class AssetEngine:
         self._last_p_base: Optional[float] = None
         self._last_p_base_ts: float = 0.0
         self._last_p_base_window_id: int = -1
+        self._last_decision: Optional[dict] = None  # latest decision row (for window summary)
+        self._window_fills: list = []  # fills closed during current window (incl. early exit)
 
     # ─── Strategy snapshot helpers ────────────────────────────────────────────
 
@@ -236,20 +253,41 @@ class AssetEngine:
         if self._open_pos is not None:
             exit_spot, window_pnl, trade_count = self._resolve_position()
         else:
-            # No position: still need exit_spot for summary
             if self.signal.prices:
                 exit_spot = float(self.signal.prices[-1])
             elif self.synthetic_spot.spot_mid is not None:
                 exit_spot = self.synthetic_spot.spot_mid
+            # Early-exit fills already in _window_fills
+            trade_count = len(self._window_fills)
+            window_pnl = float(sum(f.get("pnl", 0.0) for f in self._window_fills))
         price_to_beat = (self._price_to_beat or 0.0) if closed_wid > 0 else 0.0
-        if closed_wid > 0 and self._on_window_close and exit_spot > 0:
+        if closed_wid > 0 and exit_spot > 0:
             outcome = "YES" if exit_spot > price_to_beat else "NO"
-            self._on_window_close(
-                _fmt_window_id(closed_wid), self.spec.symbol,
-                price_to_beat, exit_spot, outcome, trade_count, window_pnl,
+            trade_snap = self._window_fills[-1] if self._window_fills else None
+            if trade_snap is None and trade_count == 0:
+                trade_count = 0
+                window_pnl = 0.0
+            elif self._window_fills:
+                trade_count = len(self._window_fills)
+                window_pnl = float(sum(f.get("pnl", 0.0) for f in self._window_fills))
+            self._append_window_summary(
+                closed_wid=closed_wid,
+                price_to_beat=price_to_beat,
+                exit_spot=exit_spot,
+                outcome=outcome,
+                trade_count=trade_count,
+                window_pnl=window_pnl,
+                trade_snap=trade_snap,
             )
+            if self._on_window_close:
+                self._on_window_close(
+                    _fmt_window_id(closed_wid), self.spec.symbol,
+                    price_to_beat, exit_spot, outcome, trade_count, window_pnl,
+                )
         self._window_id    = wid
         self._window_start = float(wid)
+        self._last_decision = None
+        self._window_fills = []
 
         # Refresh market from Kalshi
         m = self.kalshi.find_active_market(self.spec.series_ticker)
@@ -292,8 +330,8 @@ class AssetEngine:
 
     def _resolve_position(self) -> Tuple[float, float, int]:
         """
-        Kalshi resolves YES if asset price at window end > price at window start.
-        Resolution: YES wins → YES payout $1/contract; NO wins → NO payout $1/contract.
+        Resolve open position at window end.
+        Live: prefer official Kalshi market result; paper: spot vs price_to_beat.
         Returns (exit_spot, pnl, trade_count).
         """
         pos = self._open_pos
@@ -307,27 +345,47 @@ class AssetEngine:
         elif self.signal.prices:
             exit_spot = float(self.signal.prices[-1])
         if exit_spot is None:
-            log.warning(f"[{self.spec.symbol}] Cannot resolve: no exchange price.")
-            self._open_pos = None
-            return (0.0, 0.0, 0)
+            exit_spot = 0.0
 
         ptb = pos.price_to_beat
-        if ptb is None:
-            log.warning(f"[{self.spec.symbol}] Cannot resolve: no price_to_beat.")
-            self._open_pos = None
-            return (0.0, 0.0, 0)
+        settle_source = "spot_vs_ptb"
+        won: Optional[bool] = None
 
-        # YES position: win when exit_spot > price_to_beat
-        # NO position:  win when exit_spot < price_to_beat
-        if pos.side == "yes":
-            won = exit_spot > ptb
-        else:
-            won = exit_spot < ptb
+        if not cfg.DRY_RUN:
+            # Poll Kalshi official result — do not trust local spot alone for live P&L
+            deadline = time.time() + float(getattr(cfg, "LIVE_SETTLE_POLL_SECS", 12.0))
+            official = None
+            while time.time() < deadline:
+                official = self.kalshi.get_market_result(pos.market_ticker)
+                if official in ("yes", "no"):
+                    break
+                time.sleep(0.75)
+            if official in ("yes", "no"):
+                won = (pos.side == official)
+                settle_source = f"kalshi_result:{official}"
+            else:
+                log.error(
+                    f"[{self.spec.symbol}] LIVE settle: no official result for "
+                    f"{pos.market_ticker} after poll — using spot fallback + flagging"
+                )
+                settle_source = "spot_fallback_unofficial"
+
+        if won is None:
+            if ptb is None:
+                log.warning(f"[{self.spec.symbol}] Cannot resolve: no price_to_beat.")
+                self._open_pos = None
+                return (exit_spot or 0.0, 0.0, 0)
+            if pos.side == "yes":
+                won = exit_spot > ptb
+            else:
+                won = exit_spot < ptb
+
         exit_price = 1.0 if won else 0.0
 
+        ptb_s = f"{ptb:.4f}" if ptb is not None else "n/a"
         log.info(
             f"[{self.spec.symbol}] RESOLVE side={pos.side.upper()} | "
-            f"ptb={ptb:.4f} exit={exit_spot:.4f} {'UP' if exit_spot > ptb else 'DOWN'} | "
+            f"ptb={ptb_s} exit_spot={exit_spot:.4f} source={settle_source} | "
             f"{'WIN' if won else 'LOSS'}"
         )
         window_id_str = _fmt_window_id(pos.window_id)
@@ -341,10 +399,23 @@ class AssetEngine:
             price_to_beat=ptb,
             exit_spot=exit_spot,
             side=pos.side,
+            fees=float(getattr(pos, "fees_usdc", 0.0) or 0.0),
+            skip_balance_apply=(not cfg.DRY_RUN),
+            decision=getattr(pos, "decision", None),
         )
+        self._log_calibration(pos, exit_price)
+        self._window_fills.append({
+            "side": pos.side,
+            "entry": pos.entry_price,
+            "contracts": pos.contracts,
+            "amount_usdc": pos.amount_usdc,
+            "pnl": pnl,
+            "strategy": (self._last_decision or {}).get("strategy") or "",
+            "settle_source": settle_source,
+        })
         self._open_pos = None
         self.sim.save()
-        return (exit_spot, pnl, 1)
+        return (exit_spot or 0.0, pnl, 1)
 
     def _maybe_early_exit(self, yes_prob: float) -> bool:
         """
@@ -404,10 +475,55 @@ class AssetEngine:
             price_to_beat=ptb,
             exit_spot=float(spot),
             side=pos.side,
+            decision=getattr(pos, "decision", None),
         )
+        self._window_fills.append({
+            "side": pos.side,
+            "entry": pos.entry_price,
+            "contracts": pos.contracts,
+            "amount_usdc": pos.amount_usdc,
+            "pnl": pnl,
+            "strategy": "early_exit",
+        })
         self._open_pos = None
         self.sim.save()
         return True
+
+    def _log_calibration(self, pos: OpenPosition, exit_price: float) -> None:
+        """
+        Append (predicted probability, realized outcome) so a reliability curve
+        can be built once enough settles exist. Kelly assumes p_real is
+        calibrated; that has never been measured on this system.
+        """
+        if not getattr(cfg, "DECISION_SNAPSHOT_ENABLED", True):
+            return
+        d = getattr(pos, "decision", None)
+        if not d:
+            return
+        p_real = d.get("p_real")
+        if p_real is None:
+            return
+        yes_won = exit_price >= 0.5 if pos.side == "yes" else exit_price < 0.5
+        row = {
+            "ts": datetime.now().isoformat(),
+            "asset": pos.asset,
+            "side": pos.side,
+            "p_real": round(float(p_real), 6),
+            "p_base": d.get("p_base"),
+            "p_market": d.get("p_market"),
+            "entry": round(float(pos.entry_price), 4),
+            "strategy": d.get("strategy"),
+            # Did the side we actually bought pay out?
+            "won": bool(exit_price >= 0.5),
+            "yes_outcome": bool(yes_won if pos.side == "yes" else not yes_won),
+        }
+        path = Path(getattr(cfg, "CALIBRATION_LOG", "logs/kalshi_calibration.jsonl"))
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row) + "\n")
+        except OSError as e:
+            log.debug("calibration log write failed: %s", e)
 
     # ─── Price update (called by Kalshi WS handler) ───────────────────────────
 
@@ -689,14 +805,26 @@ class AssetEngine:
             return self._wait("p_real_near_50", yes_price_raw, p_base=p_base, alpha_micro=alpha_micro)
 
         # Portfolio cap: check before strategy (hard risk limit)
+        gross = 0.0            # also recorded in the C7 decision snapshot below
+        concurrent_open = 0
         if self._all_engines:
             all_positions = [
                 e._open_pos for e in self._all_engines.values()
                 if e._open_pos is not None
             ]
+            concurrent_open = len(all_positions)
             gross = self.sim.gross_open_exposure(all_positions)
             if gross + cfg.MAX_POS_PCT > cfg.PORTFOLIO_GROSS_CAP:
                 return self._wait(f"portfolio_cap({gross:.1%})", yes_price_raw, spot_now=spot_now, spot_start=spot_start)
+            # Risk Update v1: never-exceed backstop. Windows above ~35% gross went
+            # 0-for-3 in the 2026-08-10 sample; this blocks entry regardless of
+            # per-trade sizing. Disabled (1.0) under legacy profiles.
+            hard_stop = float(getattr(cfg, "PORTFOLIO_GROSS_HARD_STOP", 1.0))
+            if gross >= hard_stop:
+                return self._wait(
+                    f"portfolio_gross_hard_stop({gross:.1%}>={hard_stop:.0%})",
+                    yes_price_raw, spot_now=spot_now, spot_start=spot_start,
+                )
 
         # Strategy router
         sm = self.synthetic_spot.spot_mid
@@ -804,11 +932,34 @@ class AssetEngine:
         frac *= vol_scalar
         frac *= entry_variance_scalar(entry_for_size)
         frac *= belief_vol_scalar(self.tracker.belief_vol)
+        # Risk Update v1 tilts — all 1.0 under legacy profiles
+        frac *= side_size_scalar(action)
+        frac *= mid_band_size_scalar(entry_for_size)
         max_pos = cfg.MAX_POS_PCT
         if activity_probe:
             max_pos = min(max_pos, float(getattr(cfg, "ACTIVITY_PROBE_SIZE_PCT", 0.025)))
         size_usd = min(self.sim.balance * frac, self.sim.balance * max_pos)
         size_usd = max(0.0, size_usd)
+
+        # Risk Update v1 lottery sleeve: cap dollars risked on cheap contracts and
+        # limit how many can be open at once. No-op when LOTTERY_MAX_RISK_PCT = 0.
+        lottery = is_lottery_entry(entry_for_size)
+        if lottery:
+            cap = lottery_size_cap_usd(entry_for_size, self.sim.balance)
+            if cap is not None:
+                size_usd = min(size_usd, cap)
+            max_lotto = int(getattr(cfg, "LOTTERY_MAX_CONCURRENT", 0) or 0)
+            if max_lotto > 0 and self._all_engines:
+                open_lotto = sum(
+                    1 for e in self._all_engines.values()
+                    if e._open_pos is not None and getattr(e._open_pos, "is_lottery", False)
+                )
+                if open_lotto >= max_lotto:
+                    return self._wait(
+                        f"lottery_sleeve_full({open_lotto}/{max_lotto})",
+                        yes_price_raw, p_base=p_base, alpha_micro=alpha_micro,
+                        spot_now=spot_now, spot_start=spot_start,
+                    )
 
         ok, reason = self.sim.can_trade(size_usd, abs(ev), min_edge, asset=self.spec.symbol)
         if not ok:
@@ -852,6 +1003,14 @@ class AssetEngine:
             "price_to_beat_source": self._price_to_beat_source,
             "time_remaining": self._time_remaining_secs(),
             "reason":        "OK",
+            # C7 instrumentation: carried onto the closed-trade row so losses can
+            # be attributed offline (previously only ~15% of fills could be joined).
+            "entry_for_size":       entry_for_size,
+            "is_lottery":           lottery,
+            "portfolio_gross_at_entry": gross,
+            "concurrent_open":      concurrent_open,
+            "min_edge":             min_edge,
+            "realized_vol":         rv,
         }
 
     # ─── Execution ────────────────────────────────────────────────────────────
@@ -884,6 +1043,19 @@ class AssetEngine:
             return
         # Kalshi: each contract costs entry_price dollars; you receive $1 on win.
         # contracts = floor(size_usd / entry_price)
+        # Live: size against Kalshi available (sim.balance is synced to available).
+        if not cfg.DRY_RUN:
+            avail = float(getattr(self.sim, "kalshi_available", self.sim.balance) or self.sim.balance)
+            if avail < float(getattr(cfg, "LIVE_MIN_AVAILABLE_USD", 2.0)):
+                log.warning(
+                    f"[{self.spec.symbol}] Aborting live order: available ${avail:.2f} "
+                    f"< min ${cfg.LIVE_MIN_AVAILABLE_USD:.2f}"
+                )
+                return
+            # Never request more premium than available cash
+            d = dict(d)
+            d["size_usd"] = min(float(d["size_usd"]), avail * 0.98)
+
         contracts = max(1, int(d["size_usd"] / max(entry_price, 0.01)))
 
         log.info(
@@ -893,7 +1065,8 @@ class AssetEngine:
             f"×{contracts} contracts (${d['size_usd']:.2f})"
         )
 
-        pos = OpenPosition(
+        # Set BEFORE order to prevent duplicate orders on rapid ticks
+        self._open_pos = OpenPosition(
             window_id     = self._window_id,
             market_ticker = self._ticker,
             asset         = self.spec.symbol,
@@ -903,21 +1076,49 @@ class AssetEngine:
             amount_usdc   = entry_price * contracts,
             entered_at    = time.time(),
             price_to_beat = self._price_to_beat,
+            is_lottery    = bool(d.get("is_lottery")),
+            decision      = dict(d),
         )
-        self._open_pos = pos  # Set BEFORE order to prevent duplicate orders on rapid ticks
-        ok = self.kalshi.place_market_order(
+        fill = self.kalshi.place_market_order(
             ticker=self._ticker,
             side=side,
             count=contracts,
+            limit_price=entry_price,
         )
-        if not ok:
+        if not fill:
             log.warning(f"[{self.spec.symbol}] Order failed — position NOT recorded.")
             self._open_pos = None
             return
 
+        # Book actual fill (live) / synthetic fill (paper)
+        fill_n = int(getattr(fill, "fill_count", contracts) or contracts)
+        fill_entry = float(getattr(fill, "entry_price", entry_price) or entry_price)
+        fill_fees = float(getattr(fill, "fees", 0.0) or 0.0)
+        fill_cost = float(getattr(fill, "cost", fill_entry * fill_n) or (fill_entry * fill_n))
+        self._open_pos = OpenPosition(
+            window_id     = self._window_id,
+            market_ticker = self._ticker,
+            asset         = self.spec.symbol,
+            side          = side,
+            entry_price   = fill_entry,
+            contracts     = fill_n,
+            amount_usdc   = fill_cost if fill_cost > 0 else fill_entry * fill_n,
+            entered_at    = time.time(),
+            price_to_beat = self._price_to_beat,
+            fees_usdc     = fill_fees,
+            order_id      = str(getattr(fill, "order_id", "") or ""),
+            is_lottery    = bool(d.get("is_lottery")),
+            decision      = dict(d),
+        )
+        if not cfg.DRY_RUN:
+            # Immediately reflect cash leaving the account for sizing
+            self.sim.balance = max(0.0, float(self.sim.balance) - float(self._open_pos.amount_usdc))
+            self.sim.kalshi_available = self.sim.balance
+
         log.info(
             f"[{self.spec.symbol}] Position open | side={side.upper()} "
-            f"entry={entry_price:.4f} ×{contracts} | ptb={self._price_to_beat}"
+            f"entry={fill_entry:.4f} ×{fill_n} cost=${self._open_pos.amount_usdc:.2f} "
+            f"fees=${fill_fees:.4f} | ptb={self._price_to_beat}"
         )
         self.sim.save()
 
@@ -1009,8 +1210,8 @@ class AssetEngine:
                 "p_real":       d.get("p_real"),
                 "p_market":     d.get("p_market"),
                 "p_base":       round(d.get("p_base"), 4) if d.get("p_base") is not None else None,
-                "spot_now":     round(spot_now, 2) if spot_now is not None else None,
-                "spot_start":   round(spot_start, 2) if spot_start is not None else None,
+                "spot_now":     _round_spot(spot_now),
+                "spot_start":   _round_spot(spot_start),
                 "alpha_micro":  round(d.get("alpha_micro"), 4) if d.get("alpha_micro") is not None else None,
                 "z_threshold":  round(d.get("z_threshold"), 4) if d.get("z_threshold") is not None else None,
                 "mispricing_base": round(d.get("mispricing_base"), 4) if d.get("mispricing_base") is not None else None,
@@ -1035,10 +1236,80 @@ class AssetEngine:
             rotate_log_if_needed(DECISION_LOG, DECISIONS_MAX_LINES, DECISIONS_KEEP_LINES)
             with open(DECISION_LOG, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec) + "\n")
+            self._last_decision = rec
             if self.recorder:
                 self.recorder.record({"_type": "feature", **rec})
         except Exception as e:
             log.warning(f"Decision log write failed: {e}")
+
+    def _append_window_summary(
+        self,
+        *,
+        closed_wid: int,
+        price_to_beat: float,
+        exit_spot: float,
+        outcome: str,
+        trade_count: int,
+        window_pnl: float,
+        trade_snap: Optional[dict],
+    ) -> None:
+        """One JSONL row per asset×window at rollover — feeds the Windows dashboard live."""
+        d = self._last_decision or {}
+        traded = trade_count > 0 and trade_snap is not None
+        if traded:
+            side = str(trade_snap.get("side") or "").lower()
+            bot_action = "BUY_YES" if side == "yes" else "BUY_NO"
+            entry = float(trade_snap.get("entry") or 0)
+            risked = float(trade_snap.get("amount_usdc") or (entry * int(trade_snap.get("contracts") or 0)))
+            pred_yes = side == "yes"
+            correct = pred_yes == (outcome == "YES")
+            reason = ""
+            strategy = trade_snap.get("strategy") or d.get("strategy") or ""
+        else:
+            action = d.get("action") or "WAIT"
+            bot_action = "NO_TRADE" if action == "WAIT" else str(action)
+            entry = None
+            risked = 0.0
+            correct = None
+            reason = (d.get("reason") or "")[:120]
+            strategy = d.get("strategy") or ""
+
+        row = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "window_id": _fmt_window_id(closed_wid),
+            "window_id_ts": closed_wid,
+            "asset": self.spec.symbol,
+            "ticker": self._ticker or d.get("ticker") or "",
+            "price_to_beat": price_to_beat,
+            "exit_spot": exit_spot,
+            "actual_outcome": outcome,
+            "bot_action": bot_action,
+            "entry": entry,
+            "contracts": int(trade_snap["contracts"]) if traded else 0,
+            "amount_usdc": round(risked, 4),
+            "pnl": round(float(window_pnl), 4),
+            "correct": correct,
+            "strategy": strategy,
+            "reason": reason,
+            "p_market": d.get("p_market"),
+            "p_base": d.get("p_base"),
+            "p_real": d.get("p_real"),
+            "lag_confidence": d.get("lag_confidence"),
+            "spot_confidence": d.get("spot_confidence"),
+            "confidence_weighted_mispricing": d.get("confidence_weighted_mispricing"),
+            "z_threshold": d.get("z_threshold"),
+            "kalshi_spread": d.get("kalshi_spread") if d.get("kalshi_spread") is not None else None,
+        }
+        try:
+            Path(WINDOW_LOG).parent.mkdir(parents=True, exist_ok=True)
+            with open(WINDOW_LOG, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row) + "\n")
+            log.info(
+                f"[WINDOW] {row['window_id']} | {row['asset']} | {bot_action} | "
+                f"outcome={outcome} | pnl={window_pnl:+.2f}"
+            )
+        except OSError as e:
+            log.warning(f"Window log write failed: {e}")
 
     def print_status(self) -> None:
         pos_str = "none"

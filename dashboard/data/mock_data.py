@@ -17,7 +17,21 @@ from .schemas import (
     TradeEvent,
 )
 
-ASSETS = ["BTC", "ETH", "SOL", "XRP"]
+ASSETS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE", "NEAR", "ZEC"]
+
+# Approximate spot levels for mock mode (must not reuse BTC prices for alts).
+MOCK_SPOT = {
+    "BTC": 65_000.0,
+    "ETH": 1_900.0,
+    "SOL": 76.0,
+    "XRP": 1.05,
+    "DOGE": 0.07,
+    "BNB": 600.0,
+    "HYPE": 55.0,
+    "NEAR": 1.60,
+    "ZEC": 510.0,
+}
+
 WAIT_REASONS = [
     "uncertain_near_50",
     "venue_dislocation",
@@ -61,6 +75,13 @@ def _make_raw_features() -> dict:
         "lag_signal": round(random.uniform(-0.1, 0.3), 4),
         "response_gap": round(random.uniform(-0.01, 0.05), 4),
     }
+
+
+def _mock_spot_now(asset: str, i: int = 0) -> float:
+    base = MOCK_SPOT.get(asset, 100.0)
+    # Scale noise with price level (~few bps)
+    noise = base * random.uniform(-0.0008, 0.0008) + i * base * 0.00001
+    return round(base + noise, 6 if base < 10 else 4 if base < 1000 else 2)
 
 
 def generate_decisions() -> List[DecisionEvent]:
@@ -108,8 +129,8 @@ def generate_decisions() -> List[DecisionEvent]:
                 diagnostics={"signal_count": random.randint(1, 20)},
                 raw_features=_make_raw_features(),
                 time_remaining_secs=round(900 - i * 25 + random.uniform(-5, 5), 1),
-                spot_now=95000.0 + i * 10 + random.uniform(-50, 50),
-                spot_start=95000.0,
+                spot_now=_mock_spot_now(asset, i),
+                spot_start=MOCK_SPOT.get(asset, 100.0),
                 kalshi_quote_age_secs=round(random.uniform(1, 25), 1),
                 kalshi_spread=round(random.uniform(0.02, 0.08), 4),
             ))
@@ -153,6 +174,7 @@ def generate_trades() -> List[TradeEvent]:
         disloc = random.uniform(0.0002, 0.0008) if is_win else random.uniform(0.0008, 0.0018)
         cwm = random.uniform(0.03, 0.08) if is_win else random.uniform(-0.02, 0.03)
 
+        contracts = 10
         events.append(TradeEvent(
             ts=ts,
             asset=asset,
@@ -160,7 +182,8 @@ def generate_trades() -> List[TradeEvent]:
             side=side,
             entry=entry,
             exit=exit_val,
-            contracts=10,
+            contracts=contracts,
+            amount_usdc=round(entry * contracts, 2),
             pnl=pnl,
             balance=balance,
             win_rate=round(wr, 4),
@@ -185,13 +208,14 @@ def generate_state_snapshots() -> dict:
 
     for i, asset in enumerate(ASSETS):
         halted = asset == "XRP"
+        start = MOCK_SPOT.get(asset, 100.0)
         snapshots[asset] = StateSnapshot(
             ts=base_ts,
             asset=asset,
             window_id=1773689400,
             time_remaining_secs=round(900 - i * 100, 1),
-            spot_now=95000.0 + i * 1000,
-            spot_start=95000.0,
+            spot_now=_mock_spot_now(asset, i),
+            spot_start=start,
             synthetic_confidence=round(0.3 + i * 0.2, 2),
             dislocation=round(random.uniform(0.0005, 0.0025), 6),
             z_threshold=round(random.uniform(-1.0, 1.0), 4),

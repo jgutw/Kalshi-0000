@@ -54,6 +54,22 @@ RECIPES: dict[str, dict[str, Any]] = {
         "profile": "max_risk_paper",
         "blurb": "max_risk $2000 (R20-style)",
     },
+    # Risk Update v1 recipes — added alongside the originals, which are unchanged.
+    "engineered": {
+        "capital": 500.0,
+        "profile": "engineered_risk",
+        "blurb": "$500 engineered_risk — same signals, ~half the position size",
+    },
+    "engineered_micro": {
+        "capital": 200.0,
+        "profile": "engineered_risk",
+        "blurb": "$200 engineered_risk — small book, capped gross + lottery sleeve",
+    },
+    "ab": {
+        "capital": 500.0,
+        "profile": "engineered_risk",
+        "blurb": "$500 engineered_risk, matched to /go standard for A/B comparison",
+    },
 }
 
 PROFILE_ALIASES = {
@@ -62,6 +78,11 @@ PROFILE_ALIASES = {
     "max_risk_paper": "max_risk_paper",
     "max_risk_micro": "max_risk_micro",
     "paper": "max_risk_paper",
+    # Risk Update v1
+    "engineered": "engineered_risk",
+    "engineered_risk": "engineered_risk",
+    "safe": "engineered_risk",
+    "live_safe": "live_safe",
 }
 
 
@@ -106,7 +127,9 @@ def resolve_profile(name: str) -> str:
         return PROFILE_ALIASES[key]
     if key in PROFILE_PRESETS:
         return key
-    raise ValueError(f"Unknown profile '{name}'. Try: max_risk_paper, max_risk_micro")
+    raise ValueError(
+        f"Unknown profile '{name}'. Try: {', '.join(PROFILE_PRESETS)}"
+    )
 
 
 def load_history(limit: int = 8) -> list[dict[str, Any]]:
@@ -193,7 +216,24 @@ def format_presets() -> str:
             )
     lines.append("")
     lines.append("Mid-round tweaks (after started): /set_max_pos 8  /sizing")
+    lines.append("Regime descriptions: /regimes")
     return "\n".join(lines)
+
+
+def format_regimes() -> str:
+    """Every trading style available, what it is, and whether it has been traded."""
+    from kalshi_bot.runtime_control import PROFILE_META, profile_description
+
+    lines = ["Trading regimes", ""]
+    for name in PROFILE_PRESETS:
+        if name in PROFILE_META:
+            lines.append(profile_description(name))
+        else:
+            lines.append(f"{name}: no description on file.")
+        lines.append("")
+    lines.append("Start one:  /start_round 500 engineered_risk")
+    lines.append("Switch mid-round:  /profile engineered_risk")
+    return "\n".join(lines).rstrip()
 
 
 def format_start_round_help() -> str:
@@ -296,6 +336,8 @@ def start_paper_round(
         if proc.poll() is not None:
             break
 
+    from kalshi_bot.runtime_control import profile_summary_line
+
     preset = PROFILE_PRESETS[profile]
     return {
         "ok": ready or proc.poll() is None,
@@ -304,9 +346,11 @@ def start_paper_round(
         "round": n,
         "capital": capital,
         "profile": profile,
+        "profile_title": profile_summary_line(profile),
         "kelly": preset.get("KELLY_FRACTION"),
         "max_pos": preset.get("MAX_POS_PCT"),
         "min_trade": preset.get("MIN_TRADE_USD"),
+        "gross_cap": preset.get("PORTFOLIO_GROSS_CAP"),
         "ready": ready,
         "exit_code": proc.poll(),
         "log": str(out_path.relative_to(PROJECT_ROOT)),
@@ -318,8 +362,10 @@ def format_start_result(result: dict[str, Any]) -> str:
         "Paper round STARTING" if result.get("ready") else "Paper round LAUNCHED",
         f"Tag: {result.get('session_tag')}",
         f"Capital: ${float(result.get('capital') or 0):,.0f}",
-        f"Profile: {result.get('profile')}",
+        f"Profile: {result.get('profile')}"
+        + (f" — {result.get('profile_title')}" if result.get("profile_title") else ""),
         f"Sizing: kelly={result.get('kelly')} max_pos={float(result.get('max_pos') or 0):.0%} "
+        f"gross_cap={float(result.get('gross_cap') or 0):.0%} "
         f"min_trade=${float(result.get('min_trade') or 0):.0f}",
         f"PID: {result.get('pid')}",
     ]

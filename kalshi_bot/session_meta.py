@@ -28,6 +28,7 @@ ARCHIVE_LOG_FILES = (
     "kalshi_sim.json",
     "kalshi_trades.jsonl",
     "kalshi_decisions.jsonl",
+    "kalshi_windows.jsonl",
     "kalshi_events.jsonl",
     "kalshi_features.jsonl",
     "session_meta.json",
@@ -101,6 +102,11 @@ def _config_levels() -> dict[str, Any]:
         "COOLDOWN_MINUTES": cfg.COOLDOWN_MINUTES,
         "PER_ASSET_CIRCUIT_BREAKER": cfg.PER_ASSET_CIRCUIT_BREAKER,
         "MAX_DAILY_LOSS_PCT": cfg.MAX_DAILY_LOSS_PCT,
+        # Live breaker shape (C9). Recorded because the live ceiling can override
+        # the preset, so the preset name alone no longer identifies the regime.
+        "LIVE_MAX_CONSEC_LOSSES": getattr(cfg, "LIVE_MAX_CONSEC_LOSSES", 3),
+        "LIVE_PER_ASSET_BREAKER": getattr(cfg, "LIVE_PER_ASSET_BREAKER", False),
+        "LIVE_BREAKER_MANUAL_RESUME": getattr(cfg, "LIVE_BREAKER_MANUAL_RESUME", True),
         "MAX_DRAWDOWN_PCT": getattr(cfg, "MAX_DRAWDOWN_PCT", 0.25),
         "DRAWDOWN_HALT_ENABLED": getattr(cfg, "DRAWDOWN_HALT_ENABLED", True),
         "DRAWDOWN_USE_EQUITY": getattr(cfg, "DRAWDOWN_USE_EQUITY", True),
@@ -112,6 +118,17 @@ def _config_levels() -> dict[str, Any]:
         "DRY_RUN": cfg.DRY_RUN,
         "SIM_BALANCE": cfg.SIM_BALANCE,
         "assets_enabled": [a.symbol for a in ASSETS if a.enabled],
+        # Risk Update v1 knobs. Recorded so a round's regime can be reproduced
+        # exactly later — the older archives only captured the pre-update fields.
+        "PORTFOLIO_GROSS_HARD_STOP": getattr(cfg, "PORTFOLIO_GROSS_HARD_STOP", 1.0),
+        "LOTTERY_ENTRY_MAX": getattr(cfg, "LOTTERY_ENTRY_MAX", 0.15),
+        "LOTTERY_MAX_RISK_PCT": getattr(cfg, "LOTTERY_MAX_RISK_PCT", 0.0),
+        "LOTTERY_MAX_CONCURRENT": getattr(cfg, "LOTTERY_MAX_CONCURRENT", 0),
+        "YES_SIZE_MULT": getattr(cfg, "YES_SIZE_MULT", 1.0),
+        "NO_SIZE_MULT": getattr(cfg, "NO_SIZE_MULT", 1.0),
+        "MID_BAND_LOW": getattr(cfg, "MID_BAND_LOW", 0.20),
+        "MID_BAND_HIGH": getattr(cfg, "MID_BAND_HIGH", 0.40),
+        "MID_BAND_SIZE_MULT": getattr(cfg, "MID_BAND_SIZE_MULT", 1.0),
         "optimizations": {
             "XRP_disabled": not any(a.symbol == "XRP" and a.enabled for a in ASSETS),
             "MIN_TRADE_USD": cfg.MIN_TRADE_USD,
@@ -122,13 +139,26 @@ def _config_levels() -> dict[str, Any]:
 
 
 def _profile_note() -> str:
-    base = (
-        f"{cfg.CONFIG_PROFILE}: loose gates, large Kelly/MAX_POS, variance shrink off, "
-        "lottery entries allowed — PAPER ONLY (not for live)"
-    )
-    if cfg.CONFIG_PROFILE == "max_risk_micro":
-        return base + "; sized for $100–$300 starting capital"
-    return base
+    """One-line description of the regime this round is being traded under."""
+    profile = cfg.CONFIG_PROFILE
+    # Original wording preserved verbatim for the two regimes already on record,
+    # so archived rounds stay comparable to the new ones.
+    if profile in ("max_risk_paper", "max_risk_micro"):
+        base = (
+            f"{profile}: loose gates, large Kelly/MAX_POS, variance shrink off, "
+            "lottery entries allowed — PAPER ONLY (not for live)"
+        )
+        if profile == "max_risk_micro":
+            return base + "; sized for $100–$300 starting capital"
+        return base
+    try:
+        from .runtime_control import PROFILE_META
+        meta = PROFILE_META.get(profile)
+        if meta:
+            return f"{profile}: {meta['style']}"
+    except Exception:
+        pass
+    return f"{profile}: no description on file"
 
 
 def _archive_summary(archive_dir: Path) -> dict[str, Any]:
@@ -144,11 +174,16 @@ def _archive_summary(archive_dir: Path) -> dict[str, Any]:
     real = [t for t in _load_jsonl_trades(trades_path) if t.get("side")]
     start = float(sim.get("starting_balance", cfg.SIM_BALANCE))
     balance = float(sim.get("balance", start))
+    vault = float(sim.get("vault_balance", 0.0) or 0.0)
+    equity = float(sim.get("total_equity") or (balance + vault))
     return {
         "archive_dir": str(archive_dir.relative_to(PROJECT_ROOT)),
         "starting_balance": start,
-        "ending_balance": balance,
-        "pnl": round(balance - start, 2),
+        "ending_balance": balance,  # trading book only
+        "vault_balance": round(vault, 2),
+        "ending_equity": round(equity, 2),
+        "pnl": round(balance - start, 2),  # trading-book PnL
+        "pnl_equity": round(equity - start, 2),  # matches Telegram equity view
         "real_trades": len(real),
         "wins": sum(1 for t in real if float(t.get("pnl", 0)) > 0),
         "losses": sum(1 for t in real if float(t.get("pnl", 0)) <= 0),
@@ -314,6 +349,7 @@ def mark_session_idle(last_archive: Optional[str] = None) -> None:
     for name in (
         "kalshi_trades.jsonl",
         "kalshi_decisions.jsonl",
+        "kalshi_windows.jsonl",
         "kalshi_events.jsonl",
         "kalshi_features.jsonl",
         "near_misses.csv",

@@ -22,9 +22,12 @@ from .schemas import DecisionEvent, PortfolioSnapshot, StateSnapshot, TradeEvent
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 LOGS_DIR = ROOT / "logs"
+SESSIONS_DIR = ROOT / "sessions"
 SIM_PATH = LOGS_DIR / "kalshi_sim.json"
 TRADES_PATH = LOGS_DIR / "kalshi_trades.jsonl"
 DECISIONS_PATH = LOGS_DIR / "kalshi_decisions.jsonl"
+WINDOWS_PATH = LOGS_DIR / "kalshi_windows.jsonl"
+META_PATH = LOGS_DIR / "session_meta.json"
 
 
 def _safe_float(val, default: float = 0.0) -> float:
@@ -180,7 +183,11 @@ def load_trades() -> List[TradeEvent]:
                     continue
                 entry = _safe_float(t.get("entry"), 0.5)
                 exit_val = _safe_float(t.get("exit"), 0.0)
+                contracts = int(t.get("contracts", 0) or 0)
                 side = (t.get("side") or ("yes" if entry > 0.5 else "no")).lower()
+                amount = t.get("amount_usdc")
+                if amount is None:
+                    amount = entry * contracts
                 events.append(TradeEvent(
                     ts=t.get("ts", ""),
                     asset=t.get("asset", "BTC"),
@@ -188,7 +195,8 @@ def load_trades() -> List[TradeEvent]:
                     side=side,
                     entry=entry,
                     exit=exit_val,
-                    contracts=int(t.get("contracts", 0)),
+                    contracts=contracts,
+                    amount_usdc=_safe_float(amount, entry * contracts),
                     pnl=_safe_float(t.get("pnl"), 0.0),
                     balance=_safe_float(t.get("balance"), 1000.0),
                     win_rate=_safe_float(t.get("win_rate"), 0.0),
@@ -277,22 +285,103 @@ def load_decisions(asset: Optional[str] = None, last_n: int = 500) -> List[Decis
         return ev[-last_n:]
 
 
+def _enabled_assets() -> list:
+    try:
+        from kalshi_bot.config import enabled_asset_symbols
+        return enabled_asset_symbols()
+    except Exception:
+        return ["BTC", "ETH", "SOL"]
+
+
+def _dashboard_assets() -> list:
+    """All configured symbols (enabled + disabled) for Mission Control cards."""
+    try:
+        from kalshi_bot.config import all_asset_symbols
+        return all_asset_symbols()
+    except Exception:
+        return ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE", "NEAR", "ZEC"]
+
+
+def _placeholder_snapshot(asset: str, portfolio: PortfolioSnapshot, reason: str) -> StateSnapshot:
+    """Empty card for disabled / no-feed assets — never inject BTC-priced mock spots."""
+    return StateSnapshot(
+        ts=datetime.now(timezone.utc).isoformat(),
+        asset=asset,
+        window_id=0,
+        time_remaining_secs=0.0,
+        spot_now=None,
+        spot_start=None,
+        synthetic_confidence=0.0,
+        dislocation=0.0,
+        z_threshold=0.0,
+        p_base=None,
+        alpha_micro=0.0,
+        p_real=None,
+        p_market=None,
+        mispricing_base=None,
+        confidence_weighted_mispricing=None,
+        lag_confidence=0.0,
+        spot_confidence=0.0,
+        active_strategy="—",
+        router_action="WAIT",
+        wait_reason=reason,
+        open_position_side=None,
+        open_position_entry=None,
+        open_position_contracts=None,
+        unrealized_pnl=None,
+        halt_state=False,
+        halt_reason="",
+        kalshi_quote_age_secs=0.0,
+        kalshi_spread=0.0,
+    )
+
+
+def _load_open_positions_map() -> dict:
+    """asset → open position dict from logs/open_positions.json."""
+    path = LOGS_DIR / "open_positions.json"
+    out: dict = {}
+    try:
+        if not path.exists() or path.stat().st_size == 0:
+            return out
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for p in data.get("positions") or []:
+            a = p.get("asset")
+            if a:
+                out[a] = p
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return out
+
+
 def load_latest_snapshots() -> dict:
     """Build StateSnapshot per asset from decisions + portfolio. Falls back to mock."""
     try:
         portfolio = load_portfolio()
         decisions = load_decisions(last_n=200)
-        if not decisions:
+        open_map = _load_open_positions_map()
+        live = _live_logs_present()
+        enabled = set(_enabled_assets())
+        if not decisions and not live:
             return generate_state_snapshots()
 
         snapshots = {}
-        for asset in ["BTC", "ETH", "SOL", "XRP"]:
+        for asset in _dashboard_assets():
+            if asset not in enabled:
+                snapshots[asset] = _placeholder_snapshot(
+                    asset, portfolio, "disabled_in_config (not trading)"
+                )
+                continue
             asset_dec = [d for d in decisions if d.asset == asset]
-            if not asset_dec:
-                dec = None
-            else:
-                dec = asset_dec[-1]
+            dec = asset_dec[-1] if asset_dec else None
+            pos = open_map.get(asset)
             if dec:
+                # Prefer last non-null spot_confidence in recent ticks (WAIT stubs often omit it)
+                spot_conf = dec.spot_confidence
+                if not spot_conf:
+                    for d in reversed(asset_dec[-30:]):
+                        if d.spot_confidence:
+                            spot_conf = d.spot_confidence
+                            break
                 snapshots[asset] = StateSnapshot(
                     ts=dec.ts,
                     asset=asset,
@@ -300,7 +389,7 @@ def load_latest_snapshots() -> dict:
                     time_remaining_secs=dec.time_remaining_secs,
                     spot_now=dec.spot_now,
                     spot_start=dec.spot_start,
-                    synthetic_confidence=dec.spot_confidence,
+                    synthetic_confidence=spot_conf or 0.0,
                     dislocation=0.001,
                     z_threshold=dec.z_threshold,
                     p_base=dec.p_base,
@@ -310,19 +399,31 @@ def load_latest_snapshots() -> dict:
                     mispricing_base=dec.p_base - dec.p_market if dec.p_base and dec.p_market else None,
                     confidence_weighted_mispricing=dec.confidence_weighted_mispricing,
                     lag_confidence=dec.lag_confidence,
-                    spot_confidence=dec.spot_confidence,
+                    spot_confidence=spot_conf or 0.0,
                     active_strategy=dec.strategy,
                     router_action=dec.action,
                     wait_reason=dec.reason if dec.action == "WAIT" else "",
-                    open_position_side=None,
-                    open_position_entry=None,
-                    open_position_contracts=None,
+                    open_position_side=(pos.get("side") if pos else None),
+                    open_position_entry=(pos.get("entry") if pos else None),
+                    open_position_contracts=(pos.get("contracts") if pos else None),
                     unrealized_pnl=None,
                     halt_state=portfolio.halt_state,
                     halt_reason=portfolio.halt_reason,
                     kalshi_quote_age_secs=dec.kalshi_quote_age_secs,
                     kalshi_spread=dec.kalshi_spread,
                 )
+            elif live:
+                # Live session but this asset has no ticks yet — do not fake BTC prices
+                snap = _placeholder_snapshot(
+                    asset, portfolio, "no_live_decisions_yet"
+                )
+                if pos:
+                    snap.open_position_side = pos.get("side")
+                    snap.open_position_entry = pos.get("entry")
+                    snap.open_position_contracts = pos.get("contracts")
+                    snap.wait_reason = "position_open"
+                    snap.router_action = "WAIT"
+                snapshots[asset] = snap
             else:
                 mock = generate_state_snapshots()
                 snapshots[asset] = mock.get(asset, mock["BTC"])
@@ -331,28 +432,139 @@ def load_latest_snapshots() -> dict:
         return generate_state_snapshots()
 
 
+def _window_display(wid: str) -> str:
+    """Convert '2026-03-17 09:15' to '09:15-09:30'."""
+    if not wid or len(wid) < 16:
+        return wid or "?"
+    try:
+        from datetime import timedelta
+        dt = datetime.strptime(wid[:16], "%Y-%m-%d %H:%M")
+        end = dt + timedelta(minutes=15)
+        return f"{dt.strftime('%H:%M')}-{end.strftime('%H:%M')}"
+    except ValueError:
+        return wid
+
+
+def _row_from_window_log(w: dict) -> dict:
+    wid = w.get("window_id") or ""
+    return {
+        "window": _window_display(wid) if isinstance(wid, str) else "?",
+        "window_id": wid,
+        "asset": w.get("asset") or "?",
+        "price_to_beat": _safe_float(w.get("price_to_beat"), 0.0),
+        "exit_price": _safe_float(w.get("exit_spot"), 0.0),
+        "actual_outcome": w.get("actual_outcome") or "?",
+        "bot_action": w.get("bot_action") or "NO_TRADE",
+        "entry_price": w.get("entry"),
+        "risked_$": _safe_float(w.get("amount_usdc"), 0.0),
+        "pnl": _safe_float(w.get("pnl"), 0.0),
+        "correct": w.get("correct"),
+        "strategy": w.get("strategy") or "",
+        "reason": (w.get("reason") or "")[:80],
+        "p_market": w.get("p_market"),
+        "p_base": w.get("p_base"),
+        "lag": _safe_float(w.get("lag_confidence"), 0.0),
+        "spot_conf": _safe_float(w.get("spot_confidence"), 0.0),
+        "cwm": w.get("confidence_weighted_mispricing"),
+    }
+
+
+def _load_windows_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if not path.exists() or path.stat().st_size == 0:
+        return rows
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    w = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                rows.append(_row_from_window_log(w))
+    except IOError:
+        return []
+    rows.sort(key=lambda r: (r.get("window_id", ""), r.get("asset", "")), reverse=True)
+    return rows
+
+
+def _last_archive_windows_path() -> Optional[Path]:
+    """Prefer session_meta last_archive; else newest sessions/* with windows or decisions."""
+    try:
+        if META_PATH.exists():
+            meta = json.loads(META_PATH.read_text(encoding="utf-8"))
+            rel = meta.get("last_archive")
+            if rel:
+                p = ROOT / rel / "kalshi_windows.jsonl"
+                if p.exists() and p.stat().st_size > 0:
+                    return p
+                # Older archives: no windows file yet
+                return None
+    except (OSError, json.JSONDecodeError):
+        pass
+    if not SESSIONS_DIR.exists():
+        return None
+    candidates = sorted(
+        [p for p in SESSIONS_DIR.iterdir() if p.is_dir()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for c in candidates:
+        wp = c / "kalshi_windows.jsonl"
+        if wp.exists() and wp.stat().st_size > 0:
+            return wp
+    return None
+
+
 def load_window_performance() -> List[Dict[str, Any]]:
-    """Load window-level performance from trades + decisions. Group by window_id."""
+    """
+    Prefer kalshi_windows.jsonl (one row per asset×window at rollover).
+    Fall back to reconstructing from trades+decisions, then last archive.
+    """
+    rows = _load_windows_jsonl(WINDOWS_PATH)
+    if rows:
+        return rows
+
+    # Reconstruct from live trades + decisions (legacy / mid-window before first rollover file)
+    rows = _reconstruct_windows_from_trades_decisions(TRADES_PATH, DECISIONS_PATH)
+    if rows:
+        return rows
+
+    arch = _last_archive_windows_path()
+    if arch:
+        return _load_windows_jsonl(arch)
+
+    # Last resort: rebuild from newest archive decisions/trades
+    if SESSIONS_DIR.exists():
+        archives = sorted(
+            [p for p in SESSIONS_DIR.iterdir() if p.is_dir()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for a in archives[:1]:
+            rebuilt = _reconstruct_windows_from_trades_decisions(
+                a / "kalshi_trades.jsonl",
+                a / "kalshi_decisions.jsonl",
+            )
+            if rebuilt:
+                return rebuilt
+    return []
+
+
+def _reconstruct_windows_from_trades_decisions(
+    trades_path: Path,
+    decisions_path: Path,
+) -> List[Dict[str, Any]]:
+    """Legacy path: synthesize window rows from trades + last decision per window."""
     rows: List[Dict[str, Any]] = []
     trades_by_key: Dict[str, dict] = {}
     decisions_by_key: Dict[str, dict] = {}
 
-    def _window_display(wid: str) -> str:
-        """Convert '2026-03-17 09:15' to '09:15-09:30'."""
-        if not wid or len(wid) < 16:
-            return wid or "?"
-        try:
-            dt = datetime.strptime(wid[:16], "%Y-%m-%d %H:%M")
-            from datetime import timedelta
-            end = dt + timedelta(minutes=15)
-            return f"{dt.strftime('%H:%M')}-{end.strftime('%H:%M')}"
-        except ValueError:
-            return wid
-
-    # Load trades (with window_id, price_to_beat, exit_spot)
     try:
-        if TRADES_PATH.exists() and TRADES_PATH.stat().st_size > 0:
-            with open(TRADES_PATH, encoding="utf-8") as f:
+        if trades_path.exists() and trades_path.stat().st_size > 0:
+            with open(trades_path, encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -373,37 +585,45 @@ def load_window_performance() -> List[Dict[str, Any]]:
                             except (ValueError, TypeError):
                                 pass
                     asset = t.get("asset", "BTC")
-                    if wid:
-                        key = f"{wid}|{asset}"
-                        ptb = _safe_float(t.get("price_to_beat"), 0.0)
-                        exit_spot = _safe_float(t.get("exit_spot"), 0.0)
-                        entry = _safe_float(t.get("entry"), 0.5)
-                        pnl = _safe_float(t.get("pnl"), 0.0)
-                        side = "yes" if entry > 0.5 else "no"
-                        bot_action = "BUY_YES" if side == "yes" else "BUY_NO"
-                        actual = "YES" if exit_spot > ptb else "NO"
-                        pred_yes = side == "yes"
-                        actual_yes = exit_spot > ptb
-                        correct = pred_yes == actual_yes
-                        trades_by_key[key] = {
-                            "window": _window_display(wid),
-                            "window_id": wid,
-                            "asset": asset,
-                            "price_to_beat": ptb,
-                            "exit_price": exit_spot,
-                            "actual_outcome": actual,
-                            "bot_action": bot_action,
-                            "entry_price": entry,
-                            "pnl": pnl,
-                            "correct": correct,
-                        }
+                    if not wid:
+                        continue
+                    key = f"{wid}|{asset}"
+                    entry = _safe_float(t.get("entry"), 0.5)
+                    side = (t.get("side") or ("yes" if entry > 0.5 else "no")).lower()
+                    ptb = _safe_float(t.get("price_to_beat"), 0.0)
+                    exit_spot = _safe_float(t.get("exit_spot"), 0.0)
+                    amount = t.get("amount_usdc")
+                    if amount is None:
+                        amount = entry * int(t.get("contracts") or 0)
+                    bot_action = "BUY_YES" if side == "yes" else "BUY_NO"
+                    actual = "YES" if exit_spot > ptb else "NO"
+                    correct = (side == "yes") == (actual == "YES")
+                    trades_by_key[key] = {
+                        "window": _window_display(wid),
+                        "window_id": wid,
+                        "asset": asset,
+                        "price_to_beat": ptb,
+                        "exit_price": exit_spot,
+                        "actual_outcome": actual,
+                        "bot_action": bot_action,
+                        "entry_price": entry,
+                        "risked_$": _safe_float(amount, 0.0),
+                        "pnl": _safe_float(t.get("pnl"), 0.0),
+                        "correct": correct,
+                        "strategy": t.get("strategy") or "",
+                        "reason": t.get("reason") or "",
+                        "p_market": t.get("p_market"),
+                        "p_base": t.get("p_base"),
+                        "lag": _safe_float(t.get("lag_confidence_at_entry"), 0.0),
+                        "spot_conf": _safe_float(t.get("spot_confidence_at_entry"), 0.0),
+                        "cwm": t.get("confidence_weighted_mispricing_at_entry"),
+                    }
     except IOError:
         pass
 
-    # Load decisions to fill NO_TRADE rows
     try:
-        if DECISIONS_PATH.exists() and DECISIONS_PATH.stat().st_size > 0:
-            with open(DECISIONS_PATH, encoding="utf-8") as f:
+        if decisions_path.exists() and decisions_path.stat().st_size > 0:
+            with open(decisions_path, encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -426,24 +646,18 @@ def load_window_performance() -> List[Dict[str, Any]]:
     except IOError:
         pass
 
-    # Build rows: trades first, then NO_TRADE from decisions
-    seen = set()
-    for key, t in trades_by_key.items():
+    for t in trades_by_key.values():
         rows.append(t)
-        seen.add(key)
-    for key, d in decisions_by_key.items():
-        if key in seen:
-            continue
+    for d in decisions_by_key.values():
         wid = d.get("window_id", "")
         wid_ts = d.get("window_id_ts")
         if (not wid or isinstance(wid, int)) and isinstance(wid_ts, (int, float)) and wid_ts:
             wid = datetime.fromtimestamp(int(wid_ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-        ptb = _safe_float(d.get("spot_start"), 0.0)
+        ptb = _safe_float(d.get("spot_start") or d.get("price_to_beat"), 0.0)
         exit_spot = _safe_float(d.get("spot_now"), 0.0)
         action = d.get("action", "WAIT")
         bot_action = "NO_TRADE" if action == "WAIT" else action
         actual = "YES" if exit_spot > ptb else "NO" if ptb > 0 else "?"
-        correct = None if bot_action == "NO_TRADE" else (bot_action == "BUY_YES" and actual == "YES") or (bot_action == "BUY_NO" and actual == "NO")
         rows.append({
             "window": _window_display(wid) if isinstance(wid, str) else "?",
             "window_id": wid,
@@ -453,10 +667,17 @@ def load_window_performance() -> List[Dict[str, Any]]:
             "actual_outcome": actual,
             "bot_action": bot_action,
             "entry_price": None,
+            "risked_$": 0.0,
             "pnl": 0.0,
-            "correct": correct,
+            "correct": None,
+            "strategy": d.get("strategy") or "",
+            "reason": (d.get("reason") or "")[:80],
+            "p_market": d.get("p_market"),
+            "p_base": d.get("p_base"),
+            "lag": _safe_float(d.get("lag_confidence"), 0.0),
+            "spot_conf": _safe_float(d.get("spot_confidence"), 0.0),
+            "cwm": d.get("confidence_weighted_mispricing"),
         })
 
-    # Sort by window_id desc (most recent first)
     rows.sort(key=lambda r: (r.get("window_id", ""), r.get("asset", "")), reverse=True)
     return rows

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any, Optional
 
-from kalshi_bot.config import cfg
+from kalshi_bot.config import cfg, enabled_asset_symbols
 from kalshi_bot.runtime_control import (
     PROFILE_PRESETS,
     entries_paused,
@@ -52,36 +52,35 @@ def _money(x: float) -> str:
 
 def format_help() -> str:
     return (
-        "Kalshi paper bot - Telegram control\n"
+        "Kalshi bot — Telegram control\n"
         "\n"
-        "START A ROUND (easiest)\n"
+        "AFTER OUTAGE / SAFE LIVE\n"
+        "  /account              Kalshi cash + opens (truth)\n"
+        "  /resume_live micro    start LIVE sized to Kalshi cash\n"
+        "  /resume_live micro force   allow start with opens\n"
+        "\n"
+        "PAPER ROUNDS\n"
         "  /go standard          $500 max_risk\n"
-        "  /go big               $2000 max_risk\n"
         "  /go micro             $200 micro\n"
+        "  /go engineered        $500 engineered_risk (smaller sizing)\n"
         "  /start_round 500\n"
-        "  /start_round 2000 max_risk_paper\n"
-        "  /presets   /history\n"
+        "  /presets   /history   /regimes\n"
         "\n"
         "Views\n"
         "  /status  /live  /risk  /positions\n"
         "  /router  /why  /trades [n]  /windows\n"
-        "  /vault  /summary  /help\n"
+        "  /losses  /vault  /summary  /help\n"
         "\n"
-        "Vault / take-profit\n"
-        "  /take_cash <usd>\n"
-        "  /vault_auto on|off\n"
-        "  /vault_set <trigger> <skim>\n"
+        "Control (while bot running)\n"
+        "  /pause   stop new entries\n"
+        "  /resume  allow entries again\n"
+        "  /stop    archive + Excel, idle\n"
         "\n"
-        "Control\n"
-        "  /pause  /resume\n"
-        "  /stop   (archive + Excel, then idle)\n"
-        "\n"
-        "Mid-round tweaks (optional)\n"
-        "  /sizing\n"
-        "  /set_max_pos 8\n"
-        "  /set_min_trade 5\n"
-        "  /set_kelly 0.5\n"
-        "  /profile max_risk_paper\n"
+        "Mid-round tweaks\n"
+        "  /sizing  /set_max_pos 8  /set_kelly 0.25\n"
+        "  /set_min_trade 5  /profile max_risk_micro\n"
+        "  /set_consec_losses 4  /set_daily_loss 25\n"
+        "  /set_max_drawdown 30\n"
         "\n"
         "Only your TELEGRAM_CHAT_ID is accepted."
     )
@@ -146,7 +145,7 @@ def format_live() -> str:
         return format_idle_status()
     snaps = load_latest_snapshots()
     lines = ["Live (latest decisions)"]
-    for asset in ("BTC", "ETH", "SOL"):
+    for asset in enabled_asset_symbols():
         s = snaps.get(asset)
         if not s:
             lines.append(f"{asset}: no data")
@@ -219,7 +218,7 @@ def format_positions() -> str:
 def format_router() -> str:
     snaps = load_latest_snapshots()
     lines = ["Router", "asset | action | lag | spot | z | reason"]
-    for asset in ("BTC", "ETH", "SOL"):
+    for asset in enabled_asset_symbols():
         s = snaps.get(asset)
         if not s:
             continue

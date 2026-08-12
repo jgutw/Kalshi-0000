@@ -14,7 +14,7 @@ from typing import Dict, Optional
 log = logging.getLogger("kalshi_bot.synthetic_spot")
 FRESHNESS_SECS = 15.0
 
-# source_count -> confidence
+# source_count -> confidence (Coinbase/OKX/Kraken/Gemini; Binance optional)
 CONFIDENCE_MAP = {
     0: 0.0,
     1: 0.3,

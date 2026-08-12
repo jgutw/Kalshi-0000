@@ -1,5 +1,5 @@
 """
-vault.py — Profit skim / "take cash" for paper trading.
+vault.py — Profit skim / "take cash".
 
 Trading balance stays in SimState.balance (used for sizing).
 Taken profits move to vault_balance (not used for new trades).
@@ -7,6 +7,12 @@ Taken profits move to vault_balance (not used for new trades).
 Auto rule (example): when trading profit >= $200, skim $100 into the vault.
 Settings live in logs/vault_config.json (dashboard writes; bot reads).
 Manual takes enqueue logs/vault_commands.jsonl for the bot to apply safely.
+
+Live mode: Kalshi has no sub-accounts, so a vault is a soft reservation, not
+custody. LiveGuard subtracts vault_balance from synced Kalshi cash so the bot
+cannot size against it, but the dollars remain in your Kalshi account and are
+still exposed to anything that bypasses the bot (manual trades, another client,
+a bug). The only hard vault is a withdrawal to your bank.
 """
 
 from __future__ import annotations

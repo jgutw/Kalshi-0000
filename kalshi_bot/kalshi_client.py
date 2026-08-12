@@ -22,8 +22,10 @@ import hashlib
 import json
 import logging
 import time
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import requests
@@ -38,6 +40,21 @@ except ImportError:
 from .config import api_cfg, cfg
 
 log = logging.getLogger("kalshi_client")
+
+
+@dataclass
+class FillResult:
+    """Result of a live (or paper) order attempt."""
+    ok: bool
+    fill_count: int = 0
+    entry_price: float = 0.0   # price of purchased side (yes or no), 0–1
+    fees: float = 0.0
+    cost: float = 0.0          # premium paid (+ fees when known)
+    order_id: str = ""
+    raw: dict = field(default_factory=dict)
+
+    def __bool__(self) -> bool:
+        return bool(self.ok)
 
 
 class KalshiAuth:
@@ -135,7 +152,7 @@ class KalshiClient:
             r = self._sess.post(url, headers=hdrs, json=body, timeout=timeout)
             if r.ok:
                 return r.json()
-            log.warning(f"POST {path} → {r.status_code}: {r.text[:120]}")
+            log.warning(f"POST {path} → {r.status_code}: {r.text[:300]}")
         except Exception as e:
             log.error(f"POST {path} error: {e}")
         return {}
@@ -253,36 +270,190 @@ class KalshiClient:
         side: str,               # "yes" or "no"
         count: int,              # number of contracts
         client_order_id: str = "",
-    ) -> bool:
+        limit_price: Optional[float] = None,
+        max_slippage: float = 0.10,
+    ) -> FillResult:
         """
-        Place a market order (buy only — we don't short).
-        Each contract pays $1.00 at resolution; cost = mid_price × count.
-        DRY_RUN: logs and returns True without hitting the API.
+        Place an aggressive IOC buy (market-style) via Create Order V2.
+
+        Kalshi V2 quotes the YES book only:
+          bid = buy YES, ask = sell YES (= buy NO at 1 - price).
+        DRY_RUN: returns a synthetic FillResult at limit_price (truthy).
         """
+        side_l = side.lower().strip()
+        n = max(1, int(count))
         if cfg.DRY_RUN:
-            log.info(f"[SIM] BUY {side.upper()} ×{count} | {ticker}")
-            return True
+            entry = float(limit_price) if limit_price is not None else 0.50
+            entry = max(0.01, min(0.99, entry))
+            log.info(f"[SIM] BUY {side_l.upper()} ×{n} | {ticker}")
+            return FillResult(
+                ok=True,
+                fill_count=n,
+                entry_price=entry,
+                fees=0.0,
+                cost=round(entry * n, 4),
+                order_id="sim",
+            )
         if not api_cfg.KALSHI_API_KEY:
             log.warning("No API key — set KALSHI_API_KEY in .env")
-            return False
+            return FillResult(ok=False)
+
+        slip = max(0.0, min(0.50, float(max_slippage)))
+
+        # Aggressive IOC in YES-book terms so we take liquidity.
+        if side_l == "yes":
+            book_side = "bid"
+            if limit_price is None:
+                px = 0.99
+            else:
+                px = min(0.99, max(0.01, float(limit_price) + slip))
+        elif side_l == "no":
+            # Buy NO ≈ sell YES at (1 - no_price); lower YES ask = more aggressive.
+            book_side = "ask"
+            if limit_price is None:
+                px = 0.01
+            else:
+                yes_equiv = 1.0 - float(limit_price)
+                px = max(0.01, min(0.99, yes_equiv - slip))
+        else:
+            log.warning("place_market_order: side must be yes/no, got %r", side)
+            return FillResult(ok=False)
+
         body = {
             "ticker": ticker,
-            "action": "buy",
-            "side": side.lower(),
-            "count": count,
-            "type": "market",
-            "client_order_id": client_order_id or f"bot_{int(time.time())}",
+            "side": book_side,
+            "count": f"{n:.2f}",
+            "price": f"{px:.4f}",
+            "time_in_force": "immediate_or_cancel",
+            "self_trade_prevention_type": "taker_at_cross",
+            "client_order_id": client_order_id or str(uuid.uuid4()),
         }
-        result = self._post("/orders", body)
-        return bool(result.get("order"))
+        result = self._post("/portfolio/events/orders", body)
+        if not result:
+            return FillResult(ok=False)
+
+        # Legacy nested order
+        if result.get("order") and not result.get("order_id"):
+            od = result["order"] if isinstance(result.get("order"), dict) else {}
+            return FillResult(ok=True, fill_count=n, entry_price=float(limit_price or 0.5),
+                              cost=float(limit_price or 0.5) * n, order_id=str(od.get("order_id") or ""),
+                              raw=result)
+
+        order_id = str(result.get("order_id") or "")
+        try:
+            fill = float(result.get("fill_count") or 0.0)
+        except (TypeError, ValueError):
+            fill = 0.0
+        if not order_id or fill <= 0:
+            log.warning(
+                "Order accepted but unfilled (IOC): %s %s ×%d @%s | %s",
+                book_side, side_l, n, body["price"], ticker,
+            )
+            return FillResult(ok=False, order_id=order_id, raw=result)
+
+        fill_n = max(1, int(round(fill)))
+        avg_yes = None
+        try:
+            if result.get("average_fill_price") is not None:
+                avg_yes = float(result["average_fill_price"])
+        except (TypeError, ValueError):
+            avg_yes = None
+
+        if side_l == "yes":
+            entry = avg_yes if avg_yes is not None else float(limit_price or px)
+        else:
+            # Sold YES at avg_yes ⇒ bought NO at 1 - avg_yes
+            if avg_yes is not None:
+                entry = 1.0 - avg_yes
+            else:
+                entry = float(limit_price or (1.0 - px))
+        entry = max(0.01, min(0.99, float(entry)))
+
+        fee = 0.0
+        try:
+            if result.get("average_fee_paid") is not None:
+                fee = float(result["average_fee_paid"]) * fill
+        except (TypeError, ValueError):
+            fee = 0.0
+        cost = round(entry * fill_n + fee, 4)
+
+        log.info(
+            "LIVE FILL %s %s ×%d entry=%.4f fees=%.4f cost=%.4f avg_yes=%s | %s",
+            book_side, side_l.upper(), fill_n, entry, fee, cost,
+            result.get("average_fill_price"), ticker,
+        )
+        return FillResult(
+            ok=True,
+            fill_count=fill_n,
+            entry_price=entry,
+            fees=round(fee, 4),
+            cost=cost,
+            order_id=order_id,
+            raw=result,
+        )
 
     # ─── Balance / account ───────────────────────────────────────────────────
 
     def get_balance(self) -> float:
         """Return available USDC balance in dollars."""
+        return float(self.get_balance_detail().get("available") or 0.0)
+
+    def get_balance_detail(self) -> dict[str, Any]:
+        """
+        available: withdrawable cash (dollars)
+        portfolio_value: marked open exposure (dollars)
+        """
         data = self._get("/portfolio/balance")
-        cents = data.get("balance", 0) if isinstance(data, dict) else 0
-        return cents / 100.0   # Kalshi returns balance in cents
+        if not isinstance(data, dict) or not data:
+            return {"available": 0.0, "portfolio_value": 0.0, "raw": {}}
+        if data.get("balance_dollars") is not None:
+            try:
+                available = float(data["balance_dollars"])
+            except (TypeError, ValueError):
+                available = float(data.get("balance") or 0) / 100.0
+        else:
+            available = float(data.get("balance") or 0) / 100.0
+        # portfolio_value from API has been observed in cents
+        pv_raw = data.get("portfolio_value")
+        try:
+            pv = float(pv_raw or 0.0)
+        except (TypeError, ValueError):
+            pv = 0.0
+        # Heuristic: values like 2650 with available ~$60 ⇒ cents
+        if pv >= 50 and available > 0 and pv > available * 5:
+            pv = pv / 100.0
+        elif pv >= 1000 and available < 500:
+            pv = pv / 100.0
+        return {"available": available, "portfolio_value": pv, "raw": data}
+
+    def get_market_positions(self) -> list[dict]:
+        data = self._get("/portfolio/positions", params={"limit": 200})
+        if not isinstance(data, dict):
+            return []
+        return list(data.get("market_positions") or [])
+
+    def get_market_result(self, ticker: str) -> Optional[str]:
+        """
+        Official market result: 'yes', 'no', or None if not settled yet.
+        """
+        m = self.get_market(ticker)
+        if not isinstance(m, dict):
+            return None
+        result = m.get("result") or m.get("settlement_result")
+        if isinstance(result, str):
+            r = result.strip().lower()
+            if r in ("yes", "no"):
+                return r
+        # Some payloads use settlement_value 1/0 on yes
+        status = str(m.get("status") or "").lower()
+        if status in ("determined", "finalized", "settled"):
+            sv = m.get("settlement_value")
+            try:
+                if sv is not None:
+                    return "yes" if float(sv) >= 0.5 else "no"
+            except (TypeError, ValueError):
+                pass
+        return None
 
     # ─── Series verification ─────────────────────────────────────────────────
 

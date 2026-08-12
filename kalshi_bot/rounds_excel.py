@@ -103,6 +103,24 @@ ROUNDS_HEADERS = [
     "sol_trades",
     "sol_pnl_$",
     "sol_wr_%",
+    "xrp_trades",
+    "xrp_pnl_$",
+    "xrp_wr_%",
+    "doge_trades",
+    "doge_pnl_$",
+    "doge_wr_%",
+    "bnb_trades",
+    "bnb_pnl_$",
+    "bnb_wr_%",
+    "hype_trades",
+    "hype_pnl_$",
+    "hype_wr_%",
+    "near_trades",
+    "near_pnl_$",
+    "near_wr_%",
+    "zec_trades",
+    "zec_pnl_$",
+    "zec_wr_%",
     "has_trades",
 ]
 
@@ -349,7 +367,13 @@ def summarize_session(archive_dir: Path) -> Optional[dict[str, Any]]:
     payoff = (avg_win / abs(avg_loss)) if avg_loss < 0 else (999.0 if avg_win > 0 else 0.0)
 
     # Per asset
-    by_asset: dict[str, list[dict]] = {"BTC": [], "ETH": [], "SOL": [], "XRP": []}
+    by_asset: dict[str, list[dict]] = {}
+    try:
+        from .config import all_asset_symbols
+        for sym in all_asset_symbols():
+            by_asset[sym] = []
+    except Exception:
+        by_asset = {"BTC": [], "ETH": [], "SOL": [], "XRP": []}
     for t in trades:
         a = str(t.get("asset") or "?")
         by_asset.setdefault(a, []).append(t)
@@ -361,9 +385,18 @@ def summarize_session(archive_dir: Path) -> Optional[dict[str, Any]]:
         aw = sum(1 for p in ap if p > 0)
         return len(rows), float(sum(ap)), (aw / len(rows) * 100.0)
 
-    btc_n, btc_pnl, btc_wr = asset_stats(by_asset.get("BTC", []))
-    eth_n, eth_pnl, eth_wr = asset_stats(by_asset.get("ETH", []))
-    sol_n, sol_pnl, sol_wr = asset_stats(by_asset.get("SOL", []))
+    def _as(sym: str) -> tuple[int, float, float]:
+        return asset_stats(by_asset.get(sym, []))
+
+    btc_n, btc_pnl, btc_wr = _as("BTC")
+    eth_n, eth_pnl, eth_wr = _as("ETH")
+    sol_n, sol_pnl, sol_wr = _as("SOL")
+    xrp_n, xrp_pnl, xrp_wr = _as("XRP")
+    doge_n, doge_pnl, doge_wr = _as("DOGE")
+    bnb_n, bnb_pnl, bnb_wr = _as("BNB")
+    hype_n, hype_pnl, hype_wr = _as("HYPE")
+    near_n, near_pnl, near_wr = _as("NEAR")
+    zec_n, zec_pnl, zec_wr = _as("ZEC")
 
     # Entry bands
     bands: dict[str, list[float]] = {}
@@ -389,8 +422,25 @@ def summarize_session(archive_dir: Path) -> Optional[dict[str, Any]]:
 
     asset_rows = []
     round_pnl = float(sum(pnls)) if pnls else 0.0
-    for asset, rows in sorted(by_asset.items()):
+    # Always emit a row per configured asset (0 trades) so new markets show up in Excel
+    for asset in sorted(by_asset.keys()):
+        rows = by_asset.get(asset) or []
         if not rows:
+            asset_rows.append({
+                "session_tag": tag,
+                "archive_dir": str(archive_dir.relative_to(PROJECT_ROOT)),
+                "asset": asset,
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "win_rate_%": 0.0,
+                "pnl_$": 0.0,
+                "avg_pnl_$": 0.0,
+                "best_$": 0.0,
+                "worst_$": 0.0,
+                "avg_entry": 0.0,
+                "share_of_round_pnl_%": 0.0,
+            })
             continue
         ap = [_safe_float(t.get("pnl")) for t in rows]
         aw = sum(1 for p in ap if p > 0)
@@ -470,6 +520,24 @@ def summarize_session(archive_dir: Path) -> Optional[dict[str, Any]]:
         "sol_trades": sol_n,
         "sol_pnl_$": round(sol_pnl, 4),
         "sol_wr_%": round(sol_wr, 2),
+        "xrp_trades": xrp_n,
+        "xrp_pnl_$": round(xrp_pnl, 4),
+        "xrp_wr_%": round(xrp_wr, 2),
+        "doge_trades": doge_n,
+        "doge_pnl_$": round(doge_pnl, 4),
+        "doge_wr_%": round(doge_wr, 2),
+        "bnb_trades": bnb_n,
+        "bnb_pnl_$": round(bnb_pnl, 4),
+        "bnb_wr_%": round(bnb_wr, 2),
+        "hype_trades": hype_n,
+        "hype_pnl_$": round(hype_pnl, 4),
+        "hype_wr_%": round(hype_wr, 2),
+        "near_trades": near_n,
+        "near_pnl_$": round(near_pnl, 4),
+        "near_wr_%": round(near_wr, 2),
+        "zec_trades": zec_n,
+        "zec_pnl_$": round(zec_pnl, 4),
+        "zec_wr_%": round(zec_wr, 2),
         "has_trades": n > 0,
     }
 

@@ -8,16 +8,25 @@ from typing import Callable
 from kalshi_bot.runtime_control import (
     PROFILE_PRESETS,
     enqueue_bot_command,
+    profile_description,
     trading_bot_running,
 )
 from kalshi_bot.session_meta import archive_and_log_round, session_is_active
 from kalshi_bot.vault import VaultConfig, enqueue_set_config, enqueue_take_cash, load_vault_config
 
 from . import formatters as fmt
+from kalshi_bot.safe_live import (
+    format_account,
+    format_live_start_result,
+    preflight_account,
+    start_live_safe,
+)
+
 from .rounds import (
     RECIPES,
     format_history,
     format_presets,
+    format_regimes,
     format_start_result,
     format_start_round_help,
     parse_start_round_args,
@@ -55,6 +64,37 @@ def _start_round_from_args(args: list[str], send: SendFn) -> None:
         send(f"Could not start round: {e}")
 
 
+def _handle_start_with_args(args: list[str], send: SendFn) -> None:
+    """
+    /start takes no arguments, so "/start round 5000" used to print help and
+    silently drop the rest — one missing underscore away from /start_round.
+    Act on the clear cases, and say what was ignored on the rest.
+    """
+    head = args[0].lower().lstrip("/")
+    if head in ("round", "_round", "new", "new_round", "start_round"):
+        send("Heads up: the command is /start_round (underscore). Starting it for you…")
+        _start_round_from_args(args[1:], send)
+        return
+    if head in RECIPES:
+        send(f"Heads up: that recipe is /go {head}. Starting it for you…")
+        _start_round_from_args([head], send)
+        return
+    try:
+        float(head.replace("$", "").replace(",", ""))
+    except ValueError:
+        send(
+            f"/start takes no arguments, so \"{' '.join(args)}\" was ignored — "
+            "nothing started.\n\n"
+            "To start a paper round:\n"
+            "  /start_round 5000\n"
+            "  /go standard\n\n"
+            "Send /help for the full list."
+        )
+        return
+    send("Heads up: the command is /start_round. Starting it for you…")
+    _start_round_from_args(args, send)
+
+
 def handle_command(text: str, send: SendFn) -> None:
     text = (text or "").strip()
     if not text.startswith("/"):
@@ -68,6 +108,9 @@ def handle_command(text: str, send: SendFn) -> None:
 
     try:
         if cmd in ("/start", "/help"):
+            if cmd == "/start" and args:
+                _handle_start_with_args(args, send)
+                return
             send(fmt.format_help())
         elif cmd in ("/start_round", "/new", "/new_round"):
             _start_round_from_args(args, send)
@@ -87,6 +130,33 @@ def handle_command(text: str, send: SendFn) -> None:
             send(format_history(max(1, min(n, 20))))
         elif cmd == "/status":
             send(fmt.format_status())
+        elif cmd in ("/account", "/kalshi"):
+            send("Checking Kalshi account…")
+            try:
+                send(format_account(preflight_account()))
+            except Exception as e:
+                log.exception("account preflight failed")
+                send(f"Account check failed: {e}")
+        elif cmd in ("/resume_live", "/start_live", "/safe_live"):
+            # /resume_live [profile] [force]
+            profile = "max_risk_micro"
+            force = False
+            for a in args:
+                al = a.lower()
+                if al in ("force", "force_opens", "with_opens"):
+                    force = True
+                else:
+                    profile = a
+            send(
+                f"Safe LIVE resume: profile={profile}"
+                f"{' FORCE opens' if force else ''} …"
+            )
+            try:
+                result = start_live_safe(profile, force_with_opens=force)
+                send(format_live_start_result(result))
+            except Exception as e:
+                log.exception("resume_live failed")
+                send(f"Could not start live: {e}")
         elif cmd in ("/live", "/assets"):
             send(fmt.format_live())
         elif cmd == "/risk":
@@ -102,6 +172,9 @@ def handle_command(text: str, send: SendFn) -> None:
             send(fmt.format_trades(max(1, min(n, 25))))
         elif cmd == "/windows":
             send(fmt.format_windows())
+        elif cmd in ("/losses", "/ledger"):
+            from kalshi_bot.risk.loss_ledger import format_loss_ledger
+            send(format_loss_ledger())
         elif cmd == "/vault":
             send(fmt.format_vault())
         elif cmd == "/summary":
@@ -147,7 +220,12 @@ def handle_command(text: str, send: SendFn) -> None:
             send("Queued /pause — new entries will stop; open positions still manage/settle.")
         elif cmd == "/resume":
             enqueue_bot_command("resume", source="telegram")
-            send("Queued /resume — new entries allowed (unless halted).")
+            send(
+                "Queued /resume — new entries allowed, and a tripped "
+                "consecutive-loss breaker is reset.\n"
+                "LiveGuard halts (balance divergence, cash too low) are not "
+                "cleared by this; they lift on their own when healthy."
+            )
         elif cmd == "/stop":
             running = trading_bot_running()
             if not running and not session_is_active():
@@ -225,12 +303,40 @@ def handle_command(text: str, send: SendFn) -> None:
             val = _parse_pct(args[0])
             enqueue_bot_command("set_portfolio_cap", value=val, source="telegram")
             send(f"Queued PORTFOLIO_GROSS_CAP={val:.2%}")
+        elif cmd == "/set_consec_losses":
+            if not args:
+                send(
+                    "Usage: /set_consec_losses 4   (tightening only)\n"
+                    "Paper allows 2-8. Live is capped at 3 and counts the streak "
+                    "across the whole book, with no timed resume."
+                )
+                return
+            val = int(float(args[0]))
+            enqueue_bot_command("set_consec_losses", value=val, source="telegram")
+            send(f"Queued MAX_CONSEC_LOSSES={val} (breaker trips after {val} straight losses)")
+        elif cmd == "/set_daily_loss":
+            if not args:
+                send("Usage: /set_daily_loss 25   (percent of equity, 5-50)")
+                return
+            val = _parse_pct(args[0])
+            enqueue_bot_command("set_daily_loss", value=val, source="telegram")
+            send(f"Queued MAX_DAILY_LOSS_PCT={val:.2%}")
+        elif cmd == "/set_max_drawdown":
+            if not args:
+                send("Usage: /set_max_drawdown 30   (percent of equity, 5-60)")
+                return
+            val = _parse_pct(args[0])
+            enqueue_bot_command("set_max_drawdown", value=val, source="telegram")
+            send(f"Queued MAX_DRAWDOWN_PCT={val:.2%}")
+        elif cmd in ("/regimes", "/styles"):
+            send(format_regimes())
         elif cmd == "/profile":
             if not args:
                 send(
                     "Mid-round profile switch (does not reset balance).\n"
                     f"Presets: {', '.join(PROFILE_PRESETS)}\n"
                     "Example: /profile max_risk_micro\n"
+                    "What each one means: /regimes\n"
                     "For a fresh round: /go micro"
                 )
                 return
@@ -239,10 +345,13 @@ def handle_command(text: str, send: SendFn) -> None:
                 return
             name = args[0].strip().lower()
             if name not in PROFILE_PRESETS:
-                send(f"Unknown profile. Try: {', '.join(PROFILE_PRESETS)}")
+                send(f"Unknown profile. Try: {', '.join(PROFILE_PRESETS)}\nSee /regimes")
                 return
             enqueue_bot_command("profile", name=name, source="telegram")
-            send(f"Queued profile={name} (bot applies sizing/gates preset)")
+            send(
+                f"Queued profile={name} (bot applies sizing/gates preset)\n\n"
+                + profile_description(name)
+            )
         else:
             send(f"Unknown command {cmd}. Try /help")
     except ValueError:

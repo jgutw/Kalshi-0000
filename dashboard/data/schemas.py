@@ -77,6 +77,7 @@ class TradeEvent:
     entry: float
     exit: float
     contracts: int
+    amount_usdc: float  # premium risked ($) at entry
     pnl: float
     balance: float
     win_rate: float

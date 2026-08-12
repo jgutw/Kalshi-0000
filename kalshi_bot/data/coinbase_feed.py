@@ -7,7 +7,7 @@ Connects to wss://advanced-trade-ws.coinbase.com, subscribes to:
   - level2: order book snapshots and updates (bids, asks)
 
 Callbacks: on_trade(price, size, side), on_book(bids, asks), on_mid(mid)
-Product IDs: BTC-USD, ETH-USD, SOL-USD, XRP-USD
+Product IDs: {SYMBOL}-USD (BTC, ETH, SOL, XRP, DOGE, BNB, HYPE, NEAR, ZEC, …)
 """
 
 from __future__ import annotations

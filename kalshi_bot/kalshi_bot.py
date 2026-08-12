@@ -38,14 +38,18 @@ from typing import Dict, List, Optional
 
 import websockets
 
-from .config import cfg, api_cfg, ASSETS, AssetSpec
+from .config import cfg, api_cfg, ASSETS, AssetSpec, all_asset_symbols
+from .data.kraken_feed import SYMBOL_TO_PAIR as KRAKEN_PAIRS
+from .data.gemini_feed import SYMBOL_TO_PAIR as GEMINI_PAIRS
 from .kalshi_client import KalshiClient
 from .signal_engine import AssetSignalEngine
 from .sim_state import SimState
+from .live_guard import LiveGuard
 from .asset_engine import AssetEngine
 from .recorder import EventRecorder
 from .data.coinbase_feed import run_coinbase_microstructure as run_coinbase_microstructure_feed
 from .data.kraken_feed import run_kraken as run_kraken_feed
+from .data.gemini_feed import run_gemini as run_gemini_feed
 from .session_meta import (
     archive_and_log_round,
     prepare_fresh_round,
@@ -103,6 +107,7 @@ class KalshiMultiBot:
             self.sim.save()  # ensure dashboard has valid file from startup
         self.recorder = EventRecorder()
         self.engines: Dict[str, AssetEngine] = {}
+        self.live_guard: LiveGuard | None = None
 
         def on_window_close(
             window_id: str, asset: str,
@@ -130,6 +135,9 @@ class KalshiMultiBot:
 
         self._shutdown = False
         log.info(f"Enabled assets: {list(self.engines.keys())}")
+
+    def _open_position_list(self):
+        return [e._open_pos for e in self.engines.values() if e._open_pos is not None]
 
     def _snapshot_open_positions(self) -> None:
         rows = []
@@ -185,7 +193,7 @@ class KalshiMultiBot:
         trades_path = root / "logs" / "kalshi_trades.jsonl"
         decisions_path = root / "logs" / "kalshi_decisions.jsonl"
         window_data: dict = {}  # window_id -> {asset -> str}
-        assets = ["BTC", "ETH", "SOL", "XRP"]
+        assets = all_asset_symbols()
 
         def _fmt_window_short(wid: str) -> str:
             if not wid or len(wid) < 16:
@@ -304,12 +312,16 @@ class KalshiMultiBot:
     # ─── Binance WebSocket (fallback — blocked for US IPs, HTTP 451) ─────────────
 
     async def run_binance(self, spec: AssetSpec) -> None:
-        """Combined aggTrade + depth20 stream. Fallback only: Binance returns HTTP 451 for US IPs."""
+        """
+        Optional aggTrade + depth20 stream.
+        US IPs get HTTP 451 — stop cleanly so Coinbase/OKX/Kraken are unaffected.
+        """
         sym  = spec.binance_symbol.lower()
         url  = f"{api_cfg.BINANCE_WS}?streams={sym}@aggTrade/{sym}@depth20@100ms"
         engine = self.engines[spec.symbol]
         sig    = engine.signal
-        log.info(f"[{spec.symbol}] Binance stream: {sym}")
+        log.info(f"[{spec.symbol}] Binance stream (optional): {sym}")
+        geo_block_logged = False
         while True:
             try:
                 async with websockets.connect(url, ping_interval=20) as ws:
@@ -324,7 +336,6 @@ class KalshiMultiBot:
                         elif "depth20" in stream:
                             bids, asks = pl.get("bids", []), pl.get("asks", [])
                             sig.update_book_binance(bids, asks)
-                            # Update synthetic spot from Binance book
                             if bids and asks:
                                 try:
                                     best_bid = max(float(b[0]) for b in bids if len(b) >= 1 and float(b[0]) > 0)
@@ -334,11 +345,17 @@ class KalshiMultiBot:
                                 except (ValueError, IndexError):
                                     pass
             except Exception as e:
-                if "451" in str(e):
-                    log.debug(f"[{spec.symbol}] Binance 451 (US block): {e} — retry in 5s")
-                else:
-                    log.error(f"[{spec.symbol}] Binance error: {e} — retry in 5s")
-                await asyncio.sleep(5)
+                err = str(e)
+                if "451" in err or "Unavailable for legal reasons" in err:
+                    if not geo_block_logged:
+                        log.warning(
+                            f"[{spec.symbol}] Binance geo-blocked (451) — disabling feed; "
+                            "using Coinbase/OKX/Kraken only"
+                        )
+                        geo_block_logged = True
+                    return
+                log.error(f"[{spec.symbol}] Binance error: {e} — retry in 30s")
+                await asyncio.sleep(30)
 
     # ─── OKX WebSocket ────────────────────────────────────────────────────────
 
@@ -429,10 +446,23 @@ class KalshiMultiBot:
 
     async def run_kraken(self, spec: AssetSpec) -> None:
         """Ticker feed for one asset from Kraken v2."""
-        pair = {"BTC": "BTC/USD", "ETH": "ETH/USD", "SOL": "SOL/USD", "XRP": "XRP/USD"}[spec.symbol]
+        pair = KRAKEN_PAIRS.get(spec.symbol)
+        if not pair:
+            log.warning(f"[{spec.symbol}] No Kraken pair mapped — skipping Kraken feed")
+            return
         engine = self.engines[spec.symbol]
         on_mid = lambda mid: engine.synthetic_spot.update("kraken", mid)
         await run_kraken_feed(spec.symbol, pair, on_mid)
+
+    async def run_gemini(self, spec: AssetSpec) -> None:
+        """BookTicker mid from Gemini (4th venue). Skips unlisted symbols (e.g. NEAR)."""
+        pair = GEMINI_PAIRS.get(spec.symbol)
+        if not pair:
+            log.info(f"[{spec.symbol}] No Gemini pair — skipping Gemini feed")
+            return
+        engine = self.engines[spec.symbol]
+        on_mid = lambda mid: engine.synthetic_spot.update("gemini", mid)
+        await run_gemini_feed(spec.symbol, pair, on_mid)
 
     # ─── Kalshi price feed ────────────────────────────────────────────────────
 
@@ -513,6 +543,19 @@ class KalshiMultiBot:
             except Exception as e:
                 log.warning("vault_poll failed: %s", e)
 
+    async def live_sync_poll(self) -> None:
+        """Keep local bankroll glued to Kalshi available cash (live only)."""
+        while not self._shutdown:
+            await asyncio.sleep(float(getattr(cfg, "LIVE_BALANCE_SYNC_SECS", 10.0)))
+            if cfg.DRY_RUN or self.live_guard is None:
+                continue
+            try:
+                self.live_guard.maybe_sync(self._open_position_list(), force=True)
+                self._snapshot_open_positions()
+                self.sim.save()
+            except Exception as e:
+                log.warning("live_sync_poll failed: %s", e)
+
     async def control_poll(self) -> None:
         """Apply Telegram runtime commands (pause/resume/sizing/stop)."""
         while not self._shutdown:
@@ -525,7 +568,7 @@ class KalshiMultiBot:
                         "equity": self.sim.total_equity,
                     }
                 )
-                process_bot_commands()
+                process_bot_commands(sim=self.sim)
                 self._snapshot_open_positions()
                 if stop_requested():
                     log.warning(
@@ -579,6 +622,17 @@ class KalshiMultiBot:
         write_live_config()
         self._snapshot_open_positions()
 
+        if not cfg.DRY_RUN:
+            log.warning("⚠ LIVE MODE — enabling LiveGuard (Kalshi cash is source of truth)")
+            self.live_guard = LiveGuard(self.kalshi, self.sim)
+            ok, msg = self.live_guard.bootstrap()
+            if not ok:
+                log.error("Live bootstrap failed: %s — not starting engines", msg)
+                self.sim.save()
+                return
+            log.info("LiveGuard: %s", msg)
+            self.sim.save()
+
         self._verify_series()
 
         if not self.engines:
@@ -593,11 +647,14 @@ class KalshiMultiBot:
             tasks.append(self.run_okx(spec))
             tasks.append(self.run_coinbase(spec))
             tasks.append(self.run_kraken(spec))
+            tasks.append(self.run_gemini(spec))
             tasks.append(self.run_price_feed(engine))
 
         tasks.append(self.heartbeat())
         tasks.append(self.vault_poll())
         tasks.append(self.control_poll())
+        if not cfg.DRY_RUN:
+            tasks.append(self.live_sync_poll())
         tasks.append(self.recorder.run())
         tasks.append(self._warmup_check())
 

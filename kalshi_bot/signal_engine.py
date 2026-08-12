@@ -617,3 +617,41 @@ def belief_vol_scalar(belief_vol: float) -> float:
     if bv >= cfg.BELIEF_VOL_MILD:
         return cfg.BELIEF_VOL_MILD_SCALE
     return 1.0
+
+
+# ─── Risk Update v1 scalars ────────────────────────────────────────────────
+# All return 1.0 (no-op) under legacy profiles; engineered_risk / live_safe
+# set the underlying cfg values. See PROPOSAL_RISK_UPDATE.md for evidence.
+
+def side_size_scalar(action: str) -> float:
+    """Size tilt by side. YES was -15% cumulative vs NO +298% risk-normalized."""
+    if str(action).upper() == "BUY_YES":
+        return float(getattr(cfg, "YES_SIZE_MULT", 1.0))
+    return float(getattr(cfg, "NO_SIZE_MULT", 1.0))
+
+
+def mid_band_size_scalar(entry_price: float) -> float:
+    """Soft shrink in the 0.20-0.40 band (profitable, but lowest return/risk)."""
+    mult = float(getattr(cfg, "MID_BAND_SIZE_MULT", 1.0))
+    if mult == 1.0:
+        return 1.0
+    lo = float(getattr(cfg, "MID_BAND_LOW", 0.20))
+    hi = float(getattr(cfg, "MID_BAND_HIGH", 0.40))
+    return mult if lo <= float(entry_price) <= hi else 1.0
+
+
+def is_lottery_entry(entry_price: float) -> bool:
+    return float(entry_price) < float(getattr(cfg, "LOTTERY_ENTRY_MAX", 0.15))
+
+
+def lottery_size_cap_usd(entry_price: float, balance: float) -> Optional[float]:
+    """
+    Dollar ceiling for cheap contracts, or None when the sleeve is disabled.
+
+    Cheap entries were 0-for-10 outside a single window but were being sized at
+    ~8.4% of equity. Keep the ticket, pay far less for it.
+    """
+    pct = float(getattr(cfg, "LOTTERY_MAX_RISK_PCT", 0.0))
+    if pct <= 0.0 or not is_lottery_entry(entry_price):
+        return None
+    return max(0.0, float(balance) * pct)

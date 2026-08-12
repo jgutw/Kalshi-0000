@@ -26,8 +26,14 @@ def render_strategy_router_panel(snapshots: Dict[str, StateSnapshot]) -> None:
         st.info("No snapshot data.")
         return
 
+    try:
+        from kalshi_bot.config import all_asset_symbols
+        asset_order = all_asset_symbols()
+    except Exception:
+        asset_order = list(snapshots.keys())
+
     rows = []
-    for asset in ["BTC", "ETH", "SOL", "XRP"]:
+    for asset in asset_order:
         s = snapshots.get(asset)
         if not s:
             continue

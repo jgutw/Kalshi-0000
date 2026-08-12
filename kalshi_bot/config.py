@@ -28,12 +28,24 @@ class AssetSpec:
 
 
 ASSETS: List[AssetSpec] = [
-    AssetSpec("BTC", "KXBTC15M", "btcusdt",  "BTC-USDT",  enabled=True),
-    AssetSpec("ETH", "KXETH15M", "ethusdt",  "ETH-USDT",  enabled=True),
-    AssetSpec("SOL", "KXSOL15M", "solusdt",  "SOL-USDT",  enabled=True),
-    # Disabled after R2/R3 (0–17% WR, net drag). Pass --enable-xrp to trade it again.
-    AssetSpec("XRP", "KXXRP15M", "xrpusdt",  "XRP-USDT",  enabled=False),
+    AssetSpec("BTC",  "KXBTC15M",  "btcusdt",  "BTC-USDT",  enabled=True),
+    AssetSpec("ETH",  "KXETH15M",  "ethusdt",  "ETH-USDT",  enabled=True),
+    AssetSpec("SOL",  "KXSOL15M",  "solusdt",  "SOL-USDT",  enabled=True),
+    AssetSpec("XRP",  "KXXRP15M",  "xrpusdt",  "XRP-USDT",  enabled=True),
+    AssetSpec("DOGE", "KXDOGE15M", "dogeusdt", "DOGE-USDT", enabled=True),
+    AssetSpec("BNB",  "KXBNB15M",  "bnbusdt",  "BNB-USDT",  enabled=True),
+    AssetSpec("HYPE", "KXHYPE15M", "hypeusdt", "HYPE-USDT", enabled=True),
+    AssetSpec("NEAR", "KXNEAR15M", "nearusdt", "NEAR-USDT", enabled=True),
+    AssetSpec("ZEC",  "KXZEC15M",  "zecusdt",  "ZEC-USDT",  enabled=True),
 ]
+
+
+def enabled_asset_symbols() -> List[str]:
+    return [a.symbol for a in ASSETS if a.enabled]
+
+
+def all_asset_symbols() -> List[str]:
+    return [a.symbol for a in ASSETS]
 
 
 # ─── Trading parameters ───────────────────────────────────────────────────────
@@ -134,6 +146,63 @@ class TradingConfig:
     SIM_FILE: str               = "logs/kalshi_sim.json"
     DRY_RUN: bool               = True
 
+    # ─── Risk Update v1 (2026-08-10) ─────────────────────────────────────────
+    # Defaults below are deliberately NEUTRAL: they reproduce pre-update behavior
+    # for max_risk_paper / max_risk_micro. The engineered_risk and live_safe
+    # presets in runtime_control.py turn them on.
+    #
+    # Evidence (174 paper trades, risk-normalized to % of equity at entry):
+    #   window gross 10-20% -> 93% of windows profitable; >35% -> 0% (n=3)
+    #   median single-trade risk was 7.65% of equity, max 13.0%
+    #   entry<0.15 was 0-for-10 outside one window, yet sized at ~8.4% risk
+    #   YES side -15% cumulative vs NO +298%
+    #   entry 0.20-0.40 is the weakest positive bucket (+0.73%/trade)
+
+    # Absolute ceiling on portfolio gross exposure. 1.0 = disabled.
+    # PORTFOLIO_GROSS_CAP gates new entries; this is the never-exceed backstop.
+    PORTFOLIO_GROSS_HARD_STOP: float = 1.0
+
+    # Lottery sleeve: cap risk on cheap contracts instead of banning them.
+    # LOTTERY_MAX_RISK_PCT = 0.0 disables the cap (full Kelly, legacy behavior).
+    LOTTERY_ENTRY_MAX: float      = 0.15
+    LOTTERY_MAX_RISK_PCT: float   = 0.0
+    LOTTERY_MAX_CONCURRENT: int   = 0     # 0 = unlimited
+
+    # Side-specific size tilt (1.0 = no tilt). Hedge against p_base upside bias.
+    YES_SIZE_MULT: float        = 1.0
+    NO_SIZE_MULT: float         = 1.0
+
+    # Mid-band tilt: 0.20-0.40 entries are profitable but weakest per unit risk.
+    # Soft multiplier, NOT a gate — hard-gating this band removes ~47% of flow.
+    MID_BAND_LOW: float         = 0.20
+    MID_BAND_HIGH: float        = 0.40
+    MID_BAND_SIZE_MULT: float   = 1.0
+
+    # C7 instrumentation — behavior-neutral, on by default so attribution works.
+    DECISION_SNAPSHOT_ENABLED: bool = True
+    CALIBRATION_LOG: str        = "logs/kalshi_calibration.jsonl"
+
+    # Live safety — Kalshi cash/fills/settles are source of truth (paper ignores these)
+    LIVE_BALANCE_SYNC_SECS: float = 10.0
+    LIVE_DIVERGENCE_HALT_USD: float = 12.0
+    LIVE_DIVERGENCE_HALT_PCT: float = 0.12
+    LIVE_SETTLE_POLL_SECS: float = 12.0
+    LIVE_SYNC_FAIL_HALT: int = 3
+    LIVE_MIN_AVAILABLE_USD: float = 2.0
+
+    # Hard ceiling on the consecutive-loss breaker whenever DRY_RUN is False.
+    # start_live_safe() still defaults to max_risk_micro, which carries the
+    # legacy value of 8, so the ceiling — not the preset — is what guarantees
+    # real money never trades on a loose breaker. Paper is unaffected.
+    LIVE_MAX_CONSEC_LOSSES: int = 3
+    # Live counts the streak across the whole book, not per asset. Per-asset
+    # scope means 3 losses on ONE symbol; with 8+ symbols the book can bleed a
+    # dozen trades before any single streak trips.
+    LIVE_PER_ASSET_BREAKER: bool = False
+    # Live breaker does not time out. COOLDOWN_MINUTES would resume into the
+    # same regime that caused the streak; an operator has to look first.
+    LIVE_BREAKER_MANUAL_RESUME: bool = True
+
 
 @dataclass
 class APIConfig:
@@ -149,6 +218,9 @@ class APIConfig:
 
     # OKX public WebSocket (secondary)
     OKX_WS: str = "wss://ws.okx.com:8443/ws/v5/public"
+
+    # Gemini public WebSocket (4th mid venue; NEAR not listed)
+    GEMINI_WS: str = "wss://ws.gemini.com"
 
     # Kalshi endpoints
     @property

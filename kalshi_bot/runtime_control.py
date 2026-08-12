@@ -27,8 +27,27 @@ LIVE_CONFIG_PATH = LOGS_DIR / "live_config.json"
 BOT_HEARTBEAT_PATH = LOGS_DIR / "bot_heartbeat.json"
 BOT_HEARTBEAT_STALE_SECS = 20.0
 
+# Risk Update v1 knobs, at their legacy no-op values. Spread into the two
+# original presets so switching back from engineered_risk / live_safe fully
+# restores the behavior those profiles were traded with.
+_LEGACY_RISK_KNOBS: dict[str, Any] = {
+    "PORTFOLIO_GROSS_HARD_STOP": 1.0,   # disabled
+    "LOTTERY_MAX_RISK_PCT": 0.0,        # no lottery cap (full Kelly)
+    "LOTTERY_MAX_CONCURRENT": 0,        # unlimited
+    "YES_SIZE_MULT": 1.0,
+    "NO_SIZE_MULT": 1.0,
+    "MID_BAND_SIZE_MULT": 1.0,
+    "MAX_CONSEC_LOSSES": 8,
+    "MAX_DAILY_LOSS_PCT": 0.40,
+    # Stated explicitly so switching profiles is deterministic: the live ceiling
+    # forces this False, and without a value here that would leak into whatever
+    # profile is applied next in the same process.
+    "PER_ASSET_CIRCUIT_BREAKER": True,
+}
+
 # Presets that Telegram /profile can apply (paper only).
 PROFILE_PRESETS: dict[str, dict[str, Any]] = {
+    # ── Original profiles — unchanged behavior (R26-R32 were traded on these) ──
     "max_risk_paper": {
         "CONFIG_PROFILE": "max_risk_paper",
         "KELLY_FRACTION": 0.50,
@@ -37,6 +56,7 @@ PROFILE_PRESETS: dict[str, dict[str, Any]] = {
         "MIN_TRADE_USD": 5.0,
         "MIN_ENTRY_PRICE": 0.02,
         "MAX_ENTRY_PRICE": 0.98,
+        **_LEGACY_RISK_KNOBS,
     },
     "max_risk_micro": {
         "CONFIG_PROFILE": "max_risk_micro",
@@ -46,8 +66,133 @@ PROFILE_PRESETS: dict[str, dict[str, Any]] = {
         "MIN_TRADE_USD": 2.0,
         "MIN_ENTRY_PRICE": 0.02,
         "MAX_ENTRY_PRICE": 0.98,
+        **_LEGACY_RISK_KNOBS,
+    },
+    # ── Risk Update v1 (see PROPOSAL_RISK_UPDATE.md) ──────────────────────────
+    # Same trade population as max_risk_paper, smaller positions. Sizing was the
+    # dominant loss driver on 2026-08-10, not signal quality.
+    "engineered_risk": {
+        "CONFIG_PROFILE": "engineered_risk",
+        "KELLY_FRACTION": 0.30,          # C2: from 0.50
+        "MAX_POS_PCT": 0.05,             # C2: from 0.08 (median trade risked 7.65%)
+        "PORTFOLIO_GROSS_CAP": 0.20,     # C1: 10-20% gross won 93% of windows
+        "PORTFOLIO_GROSS_HARD_STOP": 0.28,
+        "MIN_TRADE_USD": 2.0,
+        "MIN_ENTRY_PRICE": 0.02,         # lotteries still allowed, but capped below
+        "MAX_ENTRY_PRICE": 0.98,
+        "LOTTERY_MAX_RISK_PCT": 0.015,   # C3: was ~8.4% average
+        "LOTTERY_MAX_CONCURRENT": 1,
+        # C4: 8 was never reached before the damage was done. At ~2% risk per
+        # trade, 4 straight losses is roughly a 8-12% drawdown — early enough
+        # to be worth a human look, which is the point of the breaker.
+        "MAX_CONSEC_LOSSES": 4,
+        "PER_ASSET_CIRCUIT_BREAKER": True,   # paper regime keeps per-symbol scope
+        "MAX_DAILY_LOSS_PCT": 0.25,
+        "YES_SIZE_MULT": 0.7,            # C5: YES -15% vs NO +298% risk-normalized
+        "NO_SIZE_MULT": 1.0,
+        "MID_BAND_SIZE_MULT": 0.8,       # C6: weakest positive bucket
+    },
+    # Live candidate: strictly tighter than engineered_risk. Not auto-selected;
+    # live start still goes through safe_live preflight + LiveGuard.
+    "live_safe": {
+        "CONFIG_PROFILE": "live_safe",
+        "KELLY_FRACTION": 0.25,
+        "MAX_POS_PCT": 0.04,
+        "PORTFOLIO_GROSS_CAP": 0.15,
+        "PORTFOLIO_GROSS_HARD_STOP": 0.20,
+        "MIN_TRADE_USD": 2.0,
+        "MIN_ENTRY_PRICE": 0.15,         # no lottery tickets with real money
+        "MAX_ENTRY_PRICE": 0.95,
+        "LOTTERY_MAX_RISK_PCT": 0.005,
+        "LOTTERY_MAX_CONCURRENT": 0,
+        # Tighter than engineered_risk's 4: with real money the breaker exists to
+        # buy a human a look, not to ride out a streak. Also enforced as a live
+        # ceiling in apply_profile(), so no profile can trade live looser.
+        "MAX_CONSEC_LOSSES": 3,
+        # Whole-book scope, matching live, so a paper shadow run of this profile
+        # behaves the way real money will.
+        "PER_ASSET_CIRCUIT_BREAKER": False,
+        "MAX_DAILY_LOSS_PCT": 0.15,
+        "YES_SIZE_MULT": 0.7,
+        "NO_SIZE_MULT": 1.0,
+        "MID_BAND_SIZE_MULT": 0.8,
     },
 }
+
+
+# Human-readable description of every trading regime this bot has run or can run.
+# Kept SEPARATE from PROFILE_PRESETS on purpose: apply_profile() setattr's every
+# key of a preset onto cfg, so putting prose in there would pollute the config
+# object. Nothing here affects behavior — it is documentation the bot can print.
+PROFILE_META: dict[str, dict[str, str]] = {
+    "max_risk_paper": {
+        "title": "Max risk (paper)",
+        "style": "Aggressive fire-rate. Loose gates, half Kelly, 8% per position, "
+                 "30% gross. Variance shrink off, lottery entries allowed.",
+        "use_when": "Paper research when you want maximum sample size per round.",
+        "history": "Used for R11-R12, R19-R20, R23, R26, R29-R31 (9 rounds, 326 "
+                   "trades). Median round +88%, best +630% (R19), worst -36% "
+                   "(R29); 5 of 9 green. Highest ceiling and the deepest holes. "
+                   "Earlier regimes (disciplined_paper_v2, phase1_windows, "
+                   "balanced_flow, higher_sharpe, baseline_*) predate it and "
+                   "survive only as archives — their parameters were never "
+                   "recorded. PAPER ONLY.",
+        "status": "unchanged — preserved exactly as traded",
+    },
+    "max_risk_micro": {
+        "title": "Max risk (micro book)",
+        "style": "Same gates as max_risk_paper, sized for a small book: $2 min "
+                 "trade, 10% per position, 35% gross.",
+        "use_when": "$100-$300 starting capital, paper or cautious live micro.",
+        "history": "Used for R22, R24-R25, R27-R28, R32 and the live micro "
+                   "rounds (8 rounds, 150 trades). Median round +18%, best "
+                   "+150% (live_02), worst -46% (R28); 4 of 8 green.",
+        "status": "unchanged — preserved exactly as traded",
+    },
+    "engineered_risk": {
+        "title": "Engineered risk (Risk Update v1)",
+        "style": "Same signals and same trade population as max_risk_paper, but "
+                 "roughly half the position size: Kelly 0.30, 5% per position, "
+                 "20% gross with a 28% hard stop, lottery risk capped at 1.5%, "
+                 "breaker at 4 losses, YES sized x0.7, mid-band x0.8.",
+        "use_when": "Default paper research from 2026-08-11 onward. Run it "
+                    "alongside max_risk_paper to compare drawdown, not headline PnL.",
+        "history": "Built from 174 trades on 2026-08-10. Sizing, not signal "
+                   "quality, was the dominant loss driver: windows above 35% "
+                   "gross went 0-for-3, while 10-20% gross won 93% of windows.",
+        "status": "new — additive, does not modify any existing regime",
+    },
+    "live_safe": {
+        "title": "Live safe",
+        "style": "Strictly tighter than engineered_risk: Kelly 0.25, 4% per "
+                 "position, 15% gross, no entries below 0.15, breaker at 3 losses, "
+                 "15% daily loss limit.",
+        "use_when": "Real money only, and only after engineered_risk has run "
+                    "several paper rounds and LiveGuard is green.",
+        "history": "Never traded yet. Candidate profile only.",
+        "status": "new — additive, not auto-selected anywhere",
+    },
+}
+
+
+def profile_description(name: str) -> str:
+    """Multi-line description of a regime, for Telegram and round logs."""
+    meta = PROFILE_META.get(str(name).strip().lower())
+    if not meta:
+        return f"{name}: no description on file."
+    return (
+        f"{meta['title']} ({name})\n"
+        f"  Style:    {meta['style']}\n"
+        f"  Use when: {meta['use_when']}\n"
+        f"  History:  {meta['history']}\n"
+        f"  Status:   {meta['status']}"
+    )
+
+
+def profile_summary_line(name: str) -> str:
+    """One-line description for compact listings."""
+    meta = PROFILE_META.get(str(name).strip().lower())
+    return meta["title"] if meta else str(name)
 
 
 def _now() -> str:
@@ -166,6 +311,12 @@ def write_live_config() -> None:
         "MAX_DRAWDOWN_PCT": cfg.MAX_DRAWDOWN_PCT,
         "MAX_DAILY_LOSS_PCT": cfg.MAX_DAILY_LOSS_PCT,
         "MAX_CONSEC_LOSSES": cfg.MAX_CONSEC_LOSSES,
+        # Risk Update v1 knobs so /sizing and the dashboard show what is active
+        "PORTFOLIO_GROSS_HARD_STOP": getattr(cfg, "PORTFOLIO_GROSS_HARD_STOP", 1.0),
+        "LOTTERY_MAX_RISK_PCT": getattr(cfg, "LOTTERY_MAX_RISK_PCT", 0.0),
+        "LOTTERY_MAX_CONCURRENT": getattr(cfg, "LOTTERY_MAX_CONCURRENT", 0),
+        "YES_SIZE_MULT": getattr(cfg, "YES_SIZE_MULT", 1.0),
+        "MID_BAND_SIZE_MULT": getattr(cfg, "MID_BAND_SIZE_MULT", 1.0),
     }
     LIVE_CONFIG_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -227,15 +378,48 @@ def apply_profile(name: str) -> tuple[bool, str]:
         return False, f"Unknown profile '{name}'. Try: {', '.join(PROFILE_PRESETS)}"
     for field, value in preset.items():
         setattr(cfg, field, value)
-    return True, f"Applied profile {key}"
+    note = _apply_live_ceilings()
+    title = profile_summary_line(key)
+    return True, f"Applied profile {key} — {title}{note}"
+
+
+def _apply_live_ceilings() -> str:
+    """
+    Clamp risk knobs that must never be loose with real money, whatever preset
+    was chosen. Runs after every apply_profile(); a no-op in paper.
+
+    run_kalshi_bot sets cfg.DRY_RUN from --live *before* applying the profile,
+    so DRY_RUN is already correct here.
+    """
+    if cfg.DRY_RUN:
+        return ""
+    notes: list[str] = []
+    ceiling = int(getattr(cfg, "LIVE_MAX_CONSEC_LOSSES", 3))
+    if int(cfg.MAX_CONSEC_LOSSES) > ceiling:
+        was = int(cfg.MAX_CONSEC_LOSSES)
+        cfg.MAX_CONSEC_LOSSES = ceiling
+        log.warning("LIVE ceiling: MAX_CONSEC_LOSSES %d -> %d", was, ceiling)
+        notes.append(f"MAX_CONSEC_LOSSES {was}->{ceiling}")
+
+    per_asset = bool(getattr(cfg, "LIVE_PER_ASSET_BREAKER", False))
+    if bool(cfg.PER_ASSET_CIRCUIT_BREAKER) != per_asset:
+        cfg.PER_ASSET_CIRCUIT_BREAKER = per_asset
+        log.warning("LIVE ceiling: PER_ASSET_CIRCUIT_BREAKER -> %s", per_asset)
+        notes.append(f"PER_ASSET_CIRCUIT_BREAKER->{per_asset}")
+
+    return f" [live ceiling: {', '.join(notes)}]" if notes else ""
 
 
 def process_bot_commands(
     on_stop: Optional[Callable[[], None]] = None,
+    sim: Any = None,
 ) -> list[str]:
     """
     Drain bot_control.jsonl and apply to cfg / runtime flags.
     Returns human-readable result lines for logging.
+
+    `sim` is optional so callers without state still work; it is only needed so
+    /resume can reset a live consecutive-loss breaker, which never times out.
     """
     if not COMMANDS_PATH.exists():
         return []
@@ -262,8 +446,14 @@ def process_bot_commands(
                 set_entries_paused(True, source=str(cmd.get("source") or "telegram"))
                 results.append("entries paused")
             elif action == "resume":
-                set_entries_paused(False, source=str(cmd.get("source") or "telegram"))
-                results.append("entries resumed")
+                src = str(cmd.get("source") or "telegram")
+                set_entries_paused(False, source=src)
+                msg = "entries resumed"
+                if sim is not None:
+                    cleared = sim.clear_breaker_halt(source=src)
+                    if cleared:
+                        msg += f" | breaker reset ({cleared})"
+                results.append(msg)
             elif action == "stop":
                 request_stop(source=str(cmd.get("source") or "telegram"))
                 results.append("stop requested")
@@ -297,6 +487,31 @@ def process_bot_commands(
                 else:
                     cfg.PORTFOLIO_GROSS_CAP = val
                     results.append(f"PORTFOLIO_GROSS_CAP={val:.2%}")
+            elif action == "set_consec_losses":
+                # Circuit-breaker tightening mid-round. Loosening past the
+                # legacy 8 is refused so this can't be used to disable the
+                # breaker while a round is bleeding.
+                val = int(float(cmd["value"]))
+                hi = 8 if cfg.DRY_RUN else int(getattr(cfg, "LIVE_MAX_CONSEC_LOSSES", 3))
+                if not 2 <= val <= hi:
+                    results.append(f"set_consec_losses rejected: {val} (allowed 2-{hi})")
+                else:
+                    cfg.MAX_CONSEC_LOSSES = val
+                    results.append(f"MAX_CONSEC_LOSSES={val}")
+            elif action == "set_daily_loss":
+                val = float(cmd["value"])
+                if not 0.05 <= val <= 0.50:
+                    results.append(f"set_daily_loss rejected: {val}")
+                else:
+                    cfg.MAX_DAILY_LOSS_PCT = val
+                    results.append(f"MAX_DAILY_LOSS_PCT={val:.2%}")
+            elif action == "set_max_drawdown":
+                val = float(cmd["value"])
+                if not 0.05 <= val <= 0.60:
+                    results.append(f"set_max_drawdown rejected: {val}")
+                else:
+                    cfg.MAX_DRAWDOWN_PCT = val
+                    results.append(f"MAX_DRAWDOWN_PCT={val:.2%}")
             elif action == "profile":
                 ok, msg = apply_profile(str(cmd.get("name") or ""))
                 results.append(msg if ok else f"profile failed: {msg}")
