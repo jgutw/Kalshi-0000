@@ -2,7 +2,7 @@
 """
 analyze_overnight.py — Diagnose overnight bot performance and reconcile log files.
 
-Run from project root: python analyze_overnight.py
+Run from project root: python scripts/analyze_overnight.py
 
 Outputs:
   - WAIT reason breakdown (why no trades fired)
@@ -17,7 +17,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LOGS = PROJECT_ROOT / "logs"
 TRADES_PATH = LOGS / "kalshi_trades.jsonl"
 DECISIONS_PATH = LOGS / "kalshi_decisions.jsonl"

@@ -7,7 +7,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-LOGS = Path(__file__).resolve().parent / "logs"
+LOGS = Path(__file__).resolve().parent.parent / "logs"
 DECISIONS = LOGS / "kalshi_decisions.jsonl"
 TRADES = LOGS / "kalshi_trades.jsonl"
 SIM = LOGS / "kalshi_sim.json"

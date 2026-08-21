@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 export_excel.py — Generate professional Excel trading analytics workbook for Kalshi bot.
-Run: python export_excel.py
-      python export_excel.py --watch   (regenerate every 60s)
+Run: python scripts/export_excel.py
+      python scripts/export_excel.py --watch   (regenerate every 60s)
 Output: kalshi_report.xlsx
 """
 
@@ -22,7 +22,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 # Paths
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TRADES_PATH = PROJECT_ROOT / "logs" / "kalshi_trades.jsonl"
 SIM_PATH = PROJECT_ROOT / "logs" / "kalshi_sim.json"
 DECISIONS_PATH = PROJECT_ROOT / "logs" / "kalshi_decisions.jsonl"

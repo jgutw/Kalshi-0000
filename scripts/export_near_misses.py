@@ -8,7 +8,7 @@ Equivalent to:
   Select-Object ts, asset, p_base, p_market, p_real, confidence_weighted_mispricing, lag_confidence |
   Export-Csv logs\near_misses.csv -NoTypeInformation
 
-Run from project root: python export_near_misses.py
+Run from project root: python scripts/export_near_misses.py
 
 To analyze whether near-misses would have won: compare p_real direction vs p_market.
 - p_real > p_market → model favors YES; if contract resolved YES, missed winning trade.
@@ -22,7 +22,7 @@ import csv
 import json
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DECISIONS_PATH = PROJECT_ROOT / "logs" / "kalshi_decisions.jsonl"
 OUTPUT_PATH = PROJECT_ROOT / "logs" / "near_misses.csv"
 

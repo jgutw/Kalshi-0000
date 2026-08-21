@@ -11,8 +11,11 @@ import sys
 import time
 from pathlib import Path
 
-# Ensure project root is on path
-PROJECT_ROOT = Path(__file__).resolve().parent
+# scripts/ is on path so we can import sibling export_excel;
+# project root stays cwd-relative for logs when run from repo root.
+SCRIPTS_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPTS_DIR.parent
+sys.path.insert(0, str(SCRIPTS_DIR))
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import schedule

@@ -2,8 +2,8 @@
 Offline risk reverse-engineering for an archived (or live) trade log.
 
 Usage:
-  python analyze_session_risk.py sessions/session_2026-08-01_1651
-  python analyze_session_risk.py logs
+  python scripts/analyze_session_risk.py sessions/session_2026-08-01_1651
+  python scripts/analyze_session_risk.py logs
 """
 
 from __future__ import annotations
@@ -12,6 +12,9 @@ import argparse
 import json
 import sys
 from pathlib import Path
+
+# Allow `python scripts/analyze_session_risk.py` from repo root
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from kalshi_bot.risk.drawdown import (
     analyze_counterfactuals,
