@@ -81,7 +81,8 @@ class LiveGuard:
 
     def _fetch(self) -> Tuple[bool, float, float]:
         try:
-            detail = self.kalshi.get_balance_detail()
+            shard = int(getattr(cfg, "CRYPTO_EXCHANGE_INDEX", 2))
+            detail = self.kalshi.get_balance_detail(exchange_index=shard)
             avail = float(detail.get("available") or 0.0)
             port = float(detail.get("portfolio_value") or 0.0)
             # Sanity: empty dict / failed GET returns zeros with no key history
@@ -101,7 +102,6 @@ class LiveGuard:
     ) -> None:
         self.last_sync_ts = time.time()
         self.last_available = available
-        self.last_portfolio = portfolio
 
         # Kalshi has no sub-accounts: vaulted profit sits in the same cash balance.
         # Reserve it out of the sizing bankroll, or this sync hands skimmed cash
@@ -119,22 +119,62 @@ class LiveGuard:
             self.sim.vault_balance = vault
         tradeable = max(0.0, available - vault)
 
+        local_open = float(sum(p.amount_usdc for p in open_positions))
+        # Defense: if get_balance_detail ever hands us cents again, a $9.40
+        # ticket looks like $940 and both divergence and peak_equity explode.
+        if local_open > 1.0 and portfolio >= local_open * 20:
+            log.error(
+                "LIVE GUARD: portfolio $%.2f looks like cents vs local_open $%.2f — /100",
+                portfolio, local_open,
+            )
+            portfolio = portfolio / 100.0
+
+        # Divergence must compare premium-to-premium. portfolio_value is MTM and
+        # will look like a missing fill whenever a lottery is marked down.
+        kalshi_open = local_open
+        if open_positions:
+            try:
+                shard = int(getattr(cfg, "CRYPTO_EXCHANGE_INDEX", 2))
+                kalshi_open = float(self.kalshi.get_open_exposure_dollars(shard))
+            except Exception as e:
+                log.warning("LIVE GUARD exposure fetch failed: %s — skipping divergence", e)
+                kalshi_open = local_open
+
+        self.last_portfolio = portfolio
+
         # Sizing bankroll = withdrawable Kalshi cash the vault has no claim on
         self.sim.balance = tradeable
         self.sim.kalshi_available = float(available)
         self.sim.kalshi_portfolio_value = float(portfolio)
+
+        true_eq = float(available) + float(portfolio)
+        peak = float(self.sim.peak_equity or 0.0)
+        fresh_book = float(self.sim.total_trades or 0) == 0 and not self.sim.trades
+        if (
+            fresh_book
+            and peak > true_eq * 1.25
+            and peak > true_eq + 25.0
+        ):
+            log.warning(
+                "LIVE GUARD: clamping peak_equity $%.2f → $%.2f "
+                "(no closed trades; mark was implausible)",
+                peak, true_eq,
+            )
+            self.sim.peak_equity = max(true_eq, float(self.sim.starting_balance or true_eq))
+            self.sim.peak_balance = max(float(self.sim.peak_balance or 0.0), available)
+
         self.sim._touch_peaks()
 
-        local_open = float(sum(p.amount_usdc for p in open_positions))
-        # Portfolio mark can differ slightly from premium paid; allow configured band
+        # Premium paid vs Kalshi exposure (not MTM). Allow configured band.
         abs_lim = float(cfg.LIVE_DIVERGENCE_HALT_USD)
         pct_lim = float(cfg.LIVE_DIVERGENCE_HALT_PCT) * max(available + portfolio, local_open, 1.0)
         limit = max(abs_lim, pct_lim)
-        gap = abs(local_open - portfolio)
+        gap = abs(local_open - kalshi_open)
         if open_positions and gap > limit:
             reason = (
                 f"live_open_divergence local_open=${local_open:.2f} "
-                f"kalshi_portfolio=${portfolio:.2f} gap=${gap:.2f}>${limit:.2f}"
+                f"kalshi_exposure=${kalshi_open:.2f} mtm=${portfolio:.2f} "
+                f"gap=${gap:.2f}>${limit:.2f}"
             )
             self.sim.set_live_halt(reason)
             log.error("LIVE GUARD HALT: %s", reason)

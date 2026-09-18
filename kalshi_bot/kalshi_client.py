@@ -25,6 +25,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -40,6 +41,50 @@ except ImportError:
 from .config import api_cfg, cfg
 
 log = logging.getLogger("kalshi_client")
+
+
+def _normalize_pem(pem: str) -> str:
+    """Restore newlines when .env stores the RSA key as one escaped line."""
+    if not pem:
+        return pem
+    s = pem.strip().strip('"').strip("'")
+    if "\\n" in s and s.count("\n") < 2:
+        s = s.replace("\\n", "\n")
+    return s
+
+
+def snap_price_to_ranges(
+    price: float,
+    price_ranges: list[dict],
+    *,
+    aggressive_up: bool,
+) -> float:
+    """Snap an order price to the market's valid fixed-point grid."""
+    p = Decimal(str(max(0.0001, min(0.9999, float(price)))))
+    for band in price_ranges or []:
+        if not isinstance(band, dict):
+            continue
+        try:
+            start = Decimal(str(band["start"]))
+            end = Decimal(str(band["end"]))
+            step = Decimal(str(band["step"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if step <= 0 or p < start or p > end:
+            continue
+        offset = p - start
+        n_steps = offset / step
+        rounding = ROUND_UP if aggressive_up else ROUND_DOWN
+        snapped = start + step * n_steps.to_integral_value(rounding=rounding)
+        snapped = min(end, max(start, snapped))
+        return float(snapped)
+    # Fallback: whole-cent grid
+    cents = Decimal(str(price))
+    step = Decimal("0.01")
+    offset = cents - Decimal("0.00")
+    rounding = ROUND_UP if aggressive_up else ROUND_DOWN
+    snapped = Decimal("0.00") + step * (offset / step).to_integral_value(rounding=rounding)
+    return float(min(Decimal("0.99"), max(Decimal("0.01"), snapped)))
 
 
 @dataclass
@@ -65,7 +110,8 @@ class KalshiAuth:
         self._private_key = None
         if private_key_pem and _HAS_CRYPTO:
             try:
-                pem_bytes = private_key_pem.encode() if isinstance(private_key_pem, str) else private_key_pem
+                pem = _normalize_pem(private_key_pem) if isinstance(private_key_pem, str) else private_key_pem
+                pem_bytes = pem.encode() if isinstance(pem, str) else pem
                 self._private_key = serialization.load_pem_private_key(pem_bytes, password=None)
             except Exception as e:
                 log.error(f"Failed to load private key: {e}")
@@ -159,41 +205,79 @@ class KalshiClient:
 
     # ─── Market discovery ─────────────────────────────────────────────────────
 
+    @staticmethod
+    def _parse_close_ts(raw: Any) -> Optional[float]:
+        if not raw:
+            return None
+        s = str(raw).strip()
+        if not s:
+            return None
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _market_is_live(cls, market: dict, now: Optional[float] = None) -> bool:
+        """True when the contract is still the current tradable window."""
+        status = str(market.get("status") or "").lower()
+        if status in {"closed", "determined", "settled", "finalized", "inactive"}:
+            return False
+        close_ts = cls._parse_close_ts(market.get("close_time"))
+        if close_ts is not None and close_ts <= (now if now is not None else time.time()) - 1.0:
+            return False
+        return True
+
     def find_active_market(self, series_ticker: str) -> Optional[dict]:
         """
-        Return the currently open market for a series (e.g. KXBTC15M).
-        Kalshi returns markets sorted by close_time ascending; first open = active window.
+        Return the currently tradable 15-min market for a series (e.g. KXBTC15M).
+
+        Kalshi's status=open/active filters still return windows that have already
+        closed (settling). Pick the live contract whose close_time is soonest in
+        the future — that is the current window, not the next one listed early.
         """
-        data = self._get("/markets", params={
-            "series_ticker": series_ticker,
-            "status": "open",
-            "limit": 5,
-        })
-        markets = data.get("markets", []) if isinstance(data, dict) else []
-        if not markets:
-            # Try with status=active (Kalshi uses both terms)
+        markets: list[dict] = []
+        for status in ("open", "active"):
             data = self._get("/markets", params={
                 "series_ticker": series_ticker,
-                "status": "active",
-                "limit": 5,
+                "status": status,
+                "limit": 20,
             })
-            markets = data.get("markets", []) if isinstance(data, dict) else []
-        if markets:
-            # At rollover, old market may still appear "open" during settlement.
-            # Take the one with latest close_time = the window that just opened.
-            try:
-                markets.sort(key=lambda m: m.get("close_time", ""), reverse=True)
-            except Exception:
-                pass
-            return markets[0]
-        return None
+            batch = data.get("markets", []) if isinstance(data, dict) else []
+            if batch:
+                markets = list(batch)
+                break
+        if not markets:
+            return None
+        now = time.time()
+        live = [m for m in markets if isinstance(m, dict) and self._market_is_live(m, now)]
+        pool = live or [m for m in markets if isinstance(m, dict)]
+        if not pool:
+            return None
+
+        def _close_key(m: dict) -> float:
+            ts = self._parse_close_ts(m.get("close_time"))
+            return ts if ts is not None else 0.0
+
+        # Current window = soonest future close. If every row is already past
+        # close (fallback pool), take the latest close so we are least stale.
+        if live:
+            pool.sort(key=_close_key)
+            return pool[0]
+        pool.sort(key=_close_key, reverse=True)
+        return pool[0]
 
     def get_market(self, ticker: str) -> Optional[dict]:
         """Fetch a single market by ticker."""
         data = self._get(f"/markets/{ticker}")
         return data.get("market") if isinstance(data, dict) else None
 
-    def get_orderbook(self, ticker: str, depth: int = 10) -> dict:
+    def get_orderbook(self, ticker: str, depth: int = 100) -> dict:
         """
         Fetch current orderbook snapshot.
         Returns {"yes": [[price, size], ...], "no": [...]} with price/size as floats.
@@ -232,12 +316,34 @@ class KalshiClient:
             log.debug(f"Raw orderbook response for {ticker}: {data}")
         return result
 
+    @staticmethod
+    def _dollar_quote(raw: Any) -> float:
+        try:
+            return float(raw or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
     def get_yes_mid(self, ticker: str) -> Optional[float]:
         """
-        Derive YES probability from orderbook mid-price.
-        Returns float 0–1, or None if book is empty.
-        API uses decimal prices (0–1). Best YES bid = highest in yes; Best YES ask = 1 - best NO bid.
+        YES probability 0–1 matching the Kalshi UI quote.
+
+        Prefer market yes_bid_dollars / yes_ask_dollars (what the app shows).
+        A shallow orderbook_fp snapshot often omits the best bid, so a reconstructed
+        mid can sit 10–20¢ away from the displayed price.
         """
+        m = self.get_market(ticker) or {}
+        bid = self._dollar_quote(m.get("yes_bid_dollars"))
+        ask = self._dollar_quote(m.get("yes_ask_dollars"))
+        last = self._dollar_quote(m.get("last_price_dollars"))
+        if bid > 0 and 0.0 < ask < 1.0:
+            return max(0.01, min(0.99, (bid + ask) / 2.0))
+        if bid > 0:
+            return max(0.01, min(0.99, bid))
+        if 0.0 < ask < 1.0:
+            return max(0.01, min(0.99, ask))
+        if 0.0 < last < 1.0:
+            return max(0.01, min(0.99, last))
+
         book = self.get_orderbook(ticker)
         yes_bids = book.get("yes", [])
         no_bids = book.get("no", [])
@@ -319,6 +425,14 @@ class KalshiClient:
             log.warning("place_market_order: side must be yes/no, got %r", side)
             return FillResult(ok=False)
 
+        market = self.get_market(ticker) or {}
+        ranges = list(market.get("price_ranges") or [])
+        px = snap_price_to_ranges(
+            px,
+            ranges,
+            aggressive_up=(book_side == "bid"),
+        )
+
         body = {
             "ticker": ticker,
             "side": book_side,
@@ -327,6 +441,7 @@ class KalshiClient:
             "time_in_force": "immediate_or_cancel",
             "self_trade_prevention_type": "taker_at_cross",
             "client_order_id": client_order_id or str(uuid.uuid4()),
+            "exchange_index": int(getattr(cfg, "CRYPTO_EXCHANGE_INDEX", 2)),
         }
         result = self._post("/portfolio/events/orders", body)
         if not result:
@@ -398,12 +513,16 @@ class KalshiClient:
         """Return available USDC balance in dollars."""
         return float(self.get_balance_detail().get("available") or 0.0)
 
-    def get_balance_detail(self) -> dict[str, Any]:
+    def get_balance_detail(self, exchange_index: Optional[int] = None) -> dict[str, Any]:
         """
         available: withdrawable cash (dollars)
         portfolio_value: marked open exposure (dollars)
+
+        When exchange_index is set, reads that shard's balance (required for
+        crypto live trading after Kalshi exchange sharding).
         """
-        data = self._get("/portfolio/balance")
+        params = {"exchange_index": int(exchange_index)} if exchange_index is not None else None
+        data = self._get("/portfolio/balance", params=params)
         if not isinstance(data, dict) or not data:
             return {"available": 0.0, "portfolio_value": 0.0, "raw": {}}
         if data.get("balance_dollars") is not None:
@@ -413,24 +532,124 @@ class KalshiClient:
                 available = float(data.get("balance") or 0) / 100.0
         else:
             available = float(data.get("balance") or 0) / 100.0
-        # portfolio_value from API has been observed in cents
-        pv_raw = data.get("portfolio_value")
-        try:
-            pv = float(pv_raw or 0.0)
-        except (TypeError, ValueError):
-            pv = 0.0
-        # Heuristic: values like 2650 with available ~$60 ⇒ cents
-        if pv >= 50 and available > 0 and pv > available * 5:
-            pv = pv / 100.0
-        elif pv >= 1000 and available < 500:
-            pv = pv / 100.0
+        # portfolio_value is the same unit as `balance` (integer cents).
+        # There is usually no portfolio_value_dollars field. A previous
+        # heuristic (only divide when pv > 5x cash) treated 870 cents of a
+        # $8.70 position as $870 and tripped live_open_divergence / fake DD.
+        if data.get("portfolio_value_dollars") is not None:
+            try:
+                pv = float(data["portfolio_value_dollars"])
+            except (TypeError, ValueError):
+                pv = float(data.get("portfolio_value") or 0) / 100.0
+        else:
+            try:
+                pv = float(data.get("portfolio_value") or 0) / 100.0
+            except (TypeError, ValueError):
+                pv = 0.0
         return {"available": available, "portfolio_value": pv, "raw": data}
 
-    def get_market_positions(self) -> list[dict]:
-        data = self._get("/portfolio/positions", params={"limit": 200})
+    @staticmethod
+    def _dollars_to_centicents(amount_usd: float) -> int:
+        """Kalshi intra-transfer amounts are in centicents (1/10000 USD)."""
+        return max(1, int(round(float(amount_usd) * 10_000)))
+
+    def get_shard_balances(self) -> dict[int, float]:
+        """Return available USD per exchange shard from balance_breakdown."""
+        data = self._get("/portfolio/balance")
+        out: dict[int, float] = {}
+        if not isinstance(data, dict):
+            return out
+        for row in data.get("balance_breakdown") or []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                idx = int(row.get("exchange_index", 0))
+                bal = float(row.get("balance") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            out[idx] = bal
+        return out
+
+    def intra_transfer_shards(
+        self,
+        amount_usd: float,
+        *,
+        from_shard: int = 0,
+        to_shard: int = 2,
+    ) -> tuple[bool, str]:
+        """Move cash between Kalshi exchange shards (async on Kalshi side)."""
+        amt = float(amount_usd)
+        if amt <= 0:
+            return False, "amount must be > 0"
+        body = {
+            "source": "event_contract",
+            "destination": "event_contract",
+            "amount": self._dollars_to_centicents(amt),
+            "source_exchange_shard": int(from_shard),
+            "destination_exchange_shard": int(to_shard),
+        }
+        result = self._post("/portfolio/intra_exchange_instance_transfer", body)
+        if not result or not result.get("transfer_id"):
+            return False, f"transfer failed: {result or 'no response'}"
+        return True, str(result["transfer_id"])
+
+    def ensure_crypto_shard_funded(self, reserve_usd: Optional[float] = None) -> tuple[float, str]:
+        """
+        Preallocate cash on the crypto exchange shard for live order placement.
+        Returns (amount_transferred, status_message).
+        """
+        shard = int(getattr(cfg, "CRYPTO_EXCHANGE_INDEX", 2))
+        reserve = float(
+            reserve_usd if reserve_usd is not None else getattr(cfg, "CRYPTO_SHARD_RESERVE_USD", 0.50)
+        )
+        shards = self.get_shard_balances()
+        on_crypto = float(shards.get(shard, 0.0))
+        on_default = float(shards.get(0, 0.0))
+        # Consolidate shard-0 cash onto the crypto shard whenever live trading starts.
+        move = max(0.0, on_default - reserve)
+        if move < 0.01:
+            if on_crypto >= float(getattr(cfg, "LIVE_MIN_AVAILABLE_USD", 2.0)):
+                return 0.0, f"crypto shard funded (${on_crypto:.2f})"
+            return 0.0, (
+                f"insufficient on shard 0 (${on_default:.2f}) to fund crypto shard "
+                f"(need >${reserve + cfg.LIVE_MIN_AVAILABLE_USD:.2f})"
+            )
+        ok, tid = self.intra_transfer_shards(move, from_shard=0, to_shard=shard)
+        if not ok:
+            return 0.0, tid
+        # Transfer is async — brief pause then re-check
+        time.sleep(2.0)
+        funded = float(self.get_shard_balances().get(shard, 0.0))
+        log.warning(
+            "Funded crypto shard %d: moved $%.2f (transfer_id=%s) → shard balance $%.2f",
+            shard, move, tid, funded,
+        )
+        return move, f"transferred ${move:.2f} to shard {shard} (id={tid})"
+
+    def get_market_positions(self, exchange_index: Optional[int] = None) -> list[dict]:
+        params: dict[str, Any] = {"limit": 200}
+        if exchange_index is not None:
+            params["exchange_index"] = int(exchange_index)
+        data = self._get("/portfolio/positions", params=params)
         if not isinstance(data, dict):
             return []
         return list(data.get("market_positions") or [])
+
+    def get_open_exposure_dollars(self, exchange_index: Optional[int] = None) -> float:
+        """Sum of Kalshi market_exposure_dollars on non-zero positions (premium, not MTM)."""
+        total = 0.0
+        for m in self.get_market_positions(exchange_index=exchange_index):
+            try:
+                pos = float(m.get("position_fp") or 0.0)
+            except (TypeError, ValueError):
+                pos = 0.0
+            if abs(pos) < 1e-9:
+                continue
+            try:
+                total += abs(float(m.get("market_exposure_dollars") or 0.0))
+            except (TypeError, ValueError):
+                continue
+        return total
 
     def get_market_result(self, ticker: str) -> Optional[str]:
         """

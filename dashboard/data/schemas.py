@@ -111,3 +111,5 @@ class PortfolioSnapshot:
     vault_balance: float = 0.0
     total_equity: float = 0.0
     skimmable_profit: float = 0.0
+    kalshi_available: float = 0.0
+    kalshi_portfolio_value: float = 0.0

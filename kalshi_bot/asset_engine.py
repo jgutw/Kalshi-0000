@@ -194,12 +194,19 @@ class AssetEngine:
             book = self.kalshi.get_orderbook(self._ticker)
             yes_bids = book.get("yes", [])
             no_bids = book.get("no", [])
-            best_yes_bid = max((int(r[0]) for r in yes_bids if len(r) >= 2), default=0)
-            best_no_bid = max((int(r[0]) for r in no_bids if len(r) >= 2), default=0)
-            best_yes_ask = 100 - best_no_bid if best_no_bid > 0 else 100
-            if best_yes_bid > 0 and best_yes_ask < 100:
-                spread_cents = best_yes_ask - best_yes_bid
-                return spread_cents / 100.0
+
+            def _px(row) -> float:
+                try:
+                    return float(row[0]) if len(row) >= 2 else 0.0
+                except (TypeError, ValueError):
+                    return 0.0
+
+            best_yes_bid = max((_px(r) for r in yes_bids), default=0.0)
+            best_no_bid = max((_px(r) for r in no_bids), default=0.0)
+            # orderbook_fp is decimal 0–1 (not integer cents)
+            best_yes_ask = 1.0 - best_no_bid if best_no_bid > 0 else 1.0
+            if best_yes_bid > 0 and best_yes_ask < 1.0:
+                return max(0.0, best_yes_ask - best_yes_bid)
         except Exception:
             pass
         return 0.0
@@ -1085,13 +1092,17 @@ class AssetEngine:
             count=contracts,
             limit_price=entry_price,
         )
-        if not fill:
+        if not fill or not getattr(fill, "ok", False):
             log.warning(f"[{self.spec.symbol}] Order failed — position NOT recorded.")
             self._open_pos = None
             return
 
         # Book actual fill (live) / synthetic fill (paper)
-        fill_n = int(getattr(fill, "fill_count", contracts) or contracts)
+        fill_n = int(getattr(fill, "fill_count", 0) or 0)
+        if fill_n <= 0:
+            log.warning(f"[{self.spec.symbol}] IOC unfilled — position NOT recorded.")
+            self._open_pos = None
+            return
         fill_entry = float(getattr(fill, "entry_price", entry_price) or entry_price)
         fill_fees = float(getattr(fill, "fees", 0.0) or 0.0)
         fill_cost = float(getattr(fill, "cost", fill_entry * fill_n) or (fill_entry * fill_n))
@@ -1120,7 +1131,42 @@ class AssetEngine:
             f"entry={fill_entry:.4f} ×{fill_n} cost=${self._open_pos.amount_usdc:.2f} "
             f"fees=${fill_fees:.4f} | ptb={self._price_to_beat}"
         )
+        self._append_fill_log(d, side, fill_n, fill_entry, fill_fees, fill_cost)
         self.sim.save()
+
+    def _append_fill_log(
+        self,
+        d: dict,
+        side: str,
+        fill_n: int,
+        fill_entry: float,
+        fill_fees: float,
+        fill_cost: float,
+    ) -> None:
+        """Persist working fills so Streamlit/Telegram can show them before settlement."""
+        rec = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "asset": self.spec.symbol,
+            "ticker": self._ticker,
+            "side": side,
+            "entry": round(fill_entry, 4),
+            "contracts": fill_n,
+            "amount_usdc": round(fill_cost, 4),
+            "fees": round(fill_fees, 4),
+            "status": "open",
+            "live": not cfg.DRY_RUN,
+            "order_id": str(getattr(self._open_pos, "order_id", "") or ""),
+            "strategy": d.get("strategy") or "",
+            "p_market": d.get("p_market"),
+            "window_id": self._window_id,
+        }
+        path = Path(__file__).resolve().parent.parent / "logs" / "kalshi_fills.jsonl"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+        except OSError as e:
+            log.warning("fill log write failed: %s", e)
 
     # ─── Window timing ────────────────────────────────────────────────────────
 
@@ -1178,11 +1224,100 @@ class AssetEngine:
             "lag_signal": self.lag_tracker.lag_signal,
             "lag_confidence": self.lag_tracker.lag_confidence,
         }
+        if p_base is not None:
+            out["p_base"] = p_base
         if spot_now is not None:
             out["spot_now"] = spot_now
         if spot_start is not None:
             out["spot_start"] = spot_start
-        return out
+        forced = self._try_quota_override(out, yes_price, p_base, p_real)
+        return forced if forced is not None else out
+
+    _QUOTA_HARD_PREFIXES = (
+        "telegram_paused",
+        "circuit_breaker",
+        "signal_warmup",
+        "position_open",
+        "window_boundary",
+        "macro_blackout",
+        "venue_dislocation",
+        "no_market",
+        "no_spot",
+        "no_price",
+        "no_kalshi",
+        "early_exit",
+        "entry_too_cheap",
+        "entry_too_rich",
+        "spot_confidence_low",
+        "vol_too_high",
+    )
+
+    def _try_quota_override(
+        self,
+        wait_d: dict,
+        yes_price: float,
+        p_base: Optional[float],
+        p_real: Optional[float],
+    ) -> Optional[dict]:
+        """If the hour has no fills, rank leftover books and force one small ticket."""
+        if not getattr(cfg, "FILL_QUOTA_ENABLED", False):
+            return None
+        reason = str(wait_d.get("reason") or "")
+        if any(reason.startswith(p) for p in self._QUOTA_HARD_PREFIXES):
+            return None
+        opens = [
+            e._open_pos for e in (self._all_engines or {}).values()
+            if e._open_pos is not None
+        ]
+        if not self.sim.quota_hungry(opens):
+            return None
+        if self._open_pos is not None or not self._window_position_ok():
+            return None
+        halted, _ = self.sim.is_halted(self.spec.symbol)
+        if halted:
+            return None
+        entry = float(yes_price)
+        lo = float(getattr(cfg, "MIN_ENTRY_PRICE", 0.02))
+        hi = float(getattr(cfg, "MAX_ENTRY_PRICE", 0.98))
+        if entry < lo or entry > hi:
+            return None
+        if p_real is None:
+            if p_base is None:
+                return None
+            p_real = max(0.001, min(0.999, float(p_base)))
+        ev = float(p_real) - entry
+        if abs(ev) < 1e-6:
+            return None
+        action = "BUY_YES" if ev > 0 else "BUY_NO"
+        score = abs(ev)
+        self.sim.publish_quota_bid(self.spec.symbol, score)
+        if not self.sim.is_winning_quota_bid(self.spec.symbol):
+            wait_d["reason"] = f"quota_ranking({score:.3f})"
+            return None
+        if not self.sim.try_claim_quota():
+            return None
+        pct = float(getattr(cfg, "QUOTA_SIZE_PCT", 0.02))
+        size_usd = max(0.0, min(self.sim.balance * pct, self.sim.balance * cfg.MAX_POS_PCT))
+        if size_usd < cfg.MIN_TRADE_USD:
+            return None
+        log.warning(
+            f"[{self.spec.symbol}] FILL QUOTA — idle hour, rank-and-fire "
+            f"{action} ev={ev:+.3f} size=${size_usd:.2f} was={reason}"
+        )
+        d = dict(wait_d)
+        d.update({
+            "action": action,
+            "size_usd": size_usd,
+            "ev": ev,
+            "p_real": float(p_real),
+            "p_market": entry,
+            "p_base": p_base,
+            "conviction": 2,
+            "reason": f"fill_quota({reason.split('(')[0]})",
+            "strategy": "fill_quota",
+            "is_lottery": entry < float(getattr(cfg, "LOTTERY_ENTRY_MAX", 0.15)),
+        })
+        return d
 
     # ─── Diagnostics ───────────────────────────────────────────────────────────
 

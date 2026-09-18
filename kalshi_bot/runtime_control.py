@@ -43,6 +43,11 @@ _LEGACY_RISK_KNOBS: dict[str, Any] = {
     # forces this False, and without a value here that would leak into whatever
     # profile is applied next in the same process.
     "PER_ASSET_CIRCUIT_BREAKER": True,
+    # Activity probe off unless a preset turns it on (max_risk_micro).
+    "ACTIVITY_MANDATE_ENABLED": False,
+    "ACTIVITY_IDLE_SECS": 3600.0,
+    "FILL_QUOTA_ENABLED": False,
+    "MIN_FILLS_PER_HOUR": 1,
 }
 
 # Presets that Telegram /profile can apply (paper only).
@@ -67,6 +72,14 @@ PROFILE_PRESETS: dict[str, dict[str, Any]] = {
         "MIN_ENTRY_PRICE": 0.02,
         "MAX_ENTRY_PRICE": 0.98,
         **_LEGACY_RISK_KNOBS,
+        # After 30m with no close, ease lag/spot/edge and size a small probe.
+        # Does not bypass p_base_near_50, 1¢ books, halt, or window edge.
+        "ACTIVITY_MANDATE_ENABLED": True,
+        "ACTIVITY_IDLE_SECS": 1800.0,
+        "ACTIVITY_PROBE_SIZE_PCT": 0.025,
+        "FILL_QUOTA_ENABLED": True,
+        "MIN_FILLS_PER_HOUR": 1,
+        "QUOTA_SIZE_PCT": 0.02,
     },
     # ── Risk Update v1 (see PROPOSAL_RISK_UPDATE.md) ──────────────────────────
     # Same trade population as max_risk_paper, smaller positions. Sizing was the
@@ -91,6 +104,11 @@ PROFILE_PRESETS: dict[str, dict[str, Any]] = {
         "YES_SIZE_MULT": 0.7,            # C5: YES -15% vs NO +298% risk-normalized
         "NO_SIZE_MULT": 1.0,
         "MID_BAND_SIZE_MULT": 0.8,       # C6: weakest positive bucket
+        "ACTIVITY_MANDATE_ENABLED": False,
+        "ACTIVITY_IDLE_SECS": 3600.0,
+        "FILL_QUOTA_ENABLED": True,
+        "MIN_FILLS_PER_HOUR": 1,
+        "QUOTA_SIZE_PCT": 0.02,
     },
     # Live candidate: strictly tighter than engineered_risk. Not auto-selected;
     # live start still goes through safe_live preflight + LiveGuard.
@@ -116,6 +134,41 @@ PROFILE_PRESETS: dict[str, dict[str, Any]] = {
         "YES_SIZE_MULT": 0.7,
         "NO_SIZE_MULT": 1.0,
         "MID_BAND_SIZE_MULT": 0.8,
+        "ACTIVITY_MANDATE_ENABLED": False,
+        "ACTIVITY_IDLE_SECS": 3600.0,
+        "FILL_QUOTA_ENABLED": False,
+    },
+    # Quality-first live/paper: tighter gates + rolling Sharpe floor after warmup.
+    "higher_sharpe": {
+        "CONFIG_PROFILE": "higher_sharpe",
+        "KELLY_FRACTION": 0.25,
+        "MAX_POS_PCT": 0.04,
+        "PORTFOLIO_GROSS_CAP": 0.15,
+        "PORTFOLIO_GROSS_HARD_STOP": 0.20,
+        "MIN_TRADE_USD": 5.0,
+        "MIN_ENTRY_PRICE": 0.12,
+        "MAX_ENTRY_PRICE": 0.92,
+        "LAG_CONFIDENCE_MIN": 0.22,
+        "LAG_ABSENT_MIN": 0.18,
+        "CWM_MIN": 0.035,
+        "ALPHA_EDGE_ENABLED": False,
+        "MIN_CONVICTION": 4,
+        "P_BASE_CENTER_MIN": 0.08,
+        "SHARPE_MIN": 0.50,
+        "SHARPE_MIN_TRADES": 20,
+        "MIN_EDGE_PCT": 0.03,
+        "SPOT_CONFIDENCE_MIN": 0.45,
+        "LOTTERY_MAX_RISK_PCT": 0.01,
+        "LOTTERY_MAX_CONCURRENT": 0,
+        "YES_SIZE_MULT": 0.7,
+        "NO_SIZE_MULT": 1.0,
+        "MID_BAND_SIZE_MULT": 0.75,
+        "MAX_CONSEC_LOSSES": 3,
+        "PER_ASSET_CIRCUIT_BREAKER": True,
+        "MAX_DAILY_LOSS_PCT": 0.15,
+        "ACTIVITY_MANDATE_ENABLED": False,
+        "ACTIVITY_IDLE_SECS": 3600.0,
+        "FILL_QUOTA_ENABLED": False,
     },
 }
 
@@ -142,12 +195,14 @@ PROFILE_META: dict[str, dict[str, str]] = {
     "max_risk_micro": {
         "title": "Max risk (micro book)",
         "style": "Same gates as max_risk_paper, sized for a small book: $2 min "
-                 "trade, 10% per position, 35% gross.",
+                 "trade, 10% per position, 35% gross. After 30 minutes with no "
+                 "close, eases lag/spot/edge and sizes a 2.5% probe.",
         "use_when": "$100-$300 starting capital, paper or cautious live micro.",
         "history": "Used for R22, R24-R25, R27-R28, R32 and the live micro "
                    "rounds (8 rounds, 150 trades). Median round +18%, best "
-                   "+150% (live_02), worst -46% (R28); 4 of 8 green.",
-        "status": "unchanged — preserved exactly as traded",
+                   "+150% (live_02), worst -46% (R28); 4 of 8 green. "
+                   "30m activity probe added 2026-08-16.",
+        "status": "30m activity probe on (soft gates only)",
     },
     "engineered_risk": {
         "title": "Engineered risk (Risk Update v1)",
@@ -171,6 +226,16 @@ PROFILE_META: dict[str, dict[str, str]] = {
                     "several paper rounds and LiveGuard is green.",
         "history": "Never traded yet. Candidate profile only.",
         "status": "new — additive, not auto-selected anywhere",
+    },
+    "higher_sharpe": {
+        "title": "Higher Sharpe",
+        "style": "Quality over quantity: lag + CWM + conviction gates tightened, "
+                 "no alpha_edge overlay, no fill quota. Kelly 0.25, 4% per trade, "
+                 "15% gross. After 20 closes, pauses if rolling Sharpe < 0.50.",
+        "use_when": "Live or paper when you want risk-adjusted returns, not max fire rate.",
+        "history": "Added 2026-08-29 after live micro session lost on alpha_edge "
+                   "lottery-style entries in one window.",
+        "status": "new — live candidate with Sharpe gate",
     },
 }
 
@@ -317,6 +382,12 @@ def write_live_config() -> None:
         "LOTTERY_MAX_CONCURRENT": getattr(cfg, "LOTTERY_MAX_CONCURRENT", 0),
         "YES_SIZE_MULT": getattr(cfg, "YES_SIZE_MULT", 1.0),
         "MID_BAND_SIZE_MULT": getattr(cfg, "MID_BAND_SIZE_MULT", 1.0),
+        "ACTIVITY_MANDATE_ENABLED": getattr(cfg, "ACTIVITY_MANDATE_ENABLED", False),
+        "ACTIVITY_IDLE_SECS": getattr(cfg, "ACTIVITY_IDLE_SECS", 3600.0),
+        "ACTIVITY_PROBE_SIZE_PCT": getattr(cfg, "ACTIVITY_PROBE_SIZE_PCT", 0.025),
+        "FILL_QUOTA_ENABLED": getattr(cfg, "FILL_QUOTA_ENABLED", False),
+        "MIN_FILLS_PER_HOUR": getattr(cfg, "MIN_FILLS_PER_HOUR", 1),
+        "QUOTA_SIZE_PCT": getattr(cfg, "QUOTA_SIZE_PCT", 0.02),
     }
     LIVE_CONFIG_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 

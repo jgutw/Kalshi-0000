@@ -90,9 +90,9 @@ else:
         st.caption(f"Reason: {s.wait_reason}")
     st.caption(
         f"Strategy {s.active_strategy} · "
-        f"p_mkt={s.p_market if s.p_market is not None else '—'} · "
-        f"p_base={s.p_base if s.p_base is not None else '—'} · "
-        f"p_real={s.p_real if s.p_real is not None else '—'} · "
+        f"p_mkt={f'{s.p_market * 100:.0f}¢' if s.p_market is not None else '—'} · "
+        f"p_base={f'{s.p_base * 100:.0f}¢' if s.p_base is not None else '—'} · "
+        f"p_real={f'{s.p_real * 100:.0f}¢' if s.p_real is not None else '—'} · "
         f"z={s.z_threshold:.2f} · "
         f"t_left={s.time_remaining_secs:.0f}s · "
         f"spread={s.kalshi_spread:.3f}"

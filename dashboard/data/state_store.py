@@ -28,6 +28,8 @@ PATHS = [
     str(LOGS_DIR / "kalshi_sim.json"),
     str(LOGS_DIR / "kalshi_trades.jsonl"),
     str(LOGS_DIR / "kalshi_decisions.jsonl"),
+    str(LOGS_DIR / "kalshi_fills.jsonl"),
+    str(LOGS_DIR / "open_positions.json"),
 ]
 
 

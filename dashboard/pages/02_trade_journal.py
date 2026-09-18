@@ -13,6 +13,7 @@ import streamlit as st
 
 from dashboard.components.sidebar import render_sidebar
 from dashboard.data.state_store import StateStore
+from dashboard.data.loaders import load_working_fills
 
 auto_refresh = render_sidebar(refresh_secs=8)
 store = StateStore()
@@ -20,7 +21,23 @@ trades = store.get_trades()
 portfolio = store.get_portfolio()
 
 st.title("Journal")
-st.caption("Closed trades — risked premium vs realized P&L")
+st.caption("Closed trades — risked premium vs realized P&L. Working fills appear above the table.")
+
+working = load_working_fills()
+if working:
+    st.subheader("Working fills (not settled)")
+    wrows = []
+    for p in working:
+        wrows.append({
+            "Asset": p.get("asset") or "",
+            "Side": str(p.get("side") or "").upper(),
+            "Entry": p.get("entry"),
+            "Contracts": p.get("contracts"),
+            "Risked $": p.get("amount_usdc"),
+            "Ticker": p.get("ticker") or "",
+        })
+    st.dataframe(pd.DataFrame(wrows), use_container_width=True, hide_index=True)
+
 
 if not trades:
     st.info("No closed trades yet.")

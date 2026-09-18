@@ -492,16 +492,22 @@ class KalshiMultiBot:
                         engine.on_price_update(yes_mid)
                     else:
                         _no_price_streak += 1
-                        if _no_price_streak % 30 == 1:
+                        if _no_price_streak % 5 == 1:
                             log.info(f"[{spec.symbol}] WAIT: no_kalshi_price ({_no_price_streak} polls) — "
                                      f"market may be settling")
-                            # Try refreshing market
                             m = self.kalshi.find_active_market(spec.series_ticker)
                             if m:
                                 engine._market = m
                                 engine._ticker = m.get("ticker", "")
+                                engine._close_time_utc = m.get("close_time")
                 else:
                     _no_price_streak += 1
+                    if _no_price_streak % 5 == 1:
+                        m = self.kalshi.find_active_market(spec.series_ticker)
+                        if m:
+                            engine._market = m
+                            engine._ticker = m.get("ticker", "")
+                            engine._close_time_utc = m.get("close_time")
 
                 # Heartbeat log every 30s
                 now = time.time()
@@ -701,6 +707,8 @@ def main() -> None:
     parser.add_argument("--mode", choices=["scan", "run", "status"], default="scan")
     parser.add_argument("--live",      action="store_true", help="Enable live trading")
     parser.add_argument("--kelly",     type=float,          help="Override Kelly fraction")
+    parser.add_argument("--max-pos",   type=float,          help="Override MAX_POS_PCT (e.g. 0.04 = 4%%)")
+    parser.add_argument("--portfolio-cap", type=float,      help="Override PORTFOLIO_GROSS_CAP")
     parser.add_argument("--min-edge",  type=float,          help="Override min edge")
     parser.add_argument("--no-xrp",   action="store_true",  help="Disable XRP engine")
     parser.add_argument("--enable-xrp", action="store_true", help="Re-enable XRP (off by default)")
@@ -742,6 +750,10 @@ def main() -> None:
         log.info("Profile applied: %s", msg)
     if args.kelly:
         cfg.KELLY_FRACTION = args.kelly
+    if args.max_pos:
+        cfg.MAX_POS_PCT = args.max_pos
+    if args.portfolio_cap:
+        cfg.PORTFOLIO_GROSS_CAP = args.portfolio_cap
     if args.min_edge:
         cfg.MIN_EDGE_PCT = args.min_edge
     if args.sim_balance is not None:

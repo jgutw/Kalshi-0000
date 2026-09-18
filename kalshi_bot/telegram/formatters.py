@@ -115,7 +115,8 @@ def format_status() -> str:
     p = load_portfolio()
     rt = load_runtime()
     paused = bool(rt.get("entries_paused"))
-    equity = p.total_equity or (p.balance + p.vault_balance)
+    open_mtm = float(getattr(p, "kalshi_portfolio_value", 0.0) or 0.0)
+    equity = float(p.balance) + float(p.vault_balance) + max(0.0, open_mtm)
     pnl = equity - p.starting_balance
     pnl_pct = (pnl / p.starting_balance * 100.0) if p.starting_balance else 0.0
     dry = bool(_live("DRY_RUN", cfg.DRY_RUN))
@@ -126,9 +127,15 @@ def format_status() -> str:
     min_trade = float(_live("MIN_TRADE_USD", cfg.MIN_TRADE_USD))
     cap = float(_live("PORTFOLIO_GROSS_CAP", cfg.PORTFOLIO_GROSS_CAP))
     profile = str(_live("CONFIG_PROFILE", cfg.CONFIG_PROFILE))
+    book = f"Trading {_money(p.balance)} | Vault {_money(p.vault_balance)}"
+    if not dry and open_mtm > 0.009:
+        book = (
+            f"Trading {_money(p.balance)} | Open {_money(open_mtm)} | "
+            f"Vault {_money(p.vault_balance)}"
+        )
     lines = [
         f"Status ({mode}) | profile={profile}",
-        f"Trading {_money(p.balance)} | Vault {_money(p.vault_balance)}",
+        book,
         f"Equity  {_money(equity)} ({pnl_pct:+.1f}% / {_money(pnl)})",
         f"Trades  {p.total_trades}  W/L {p.wins}/{p.losses}  WR {_pct(p.win_rate)}",
         f"Sharpe  {p.sharpe:.2f}  VaR95 {_pct(p.var_95)}",
@@ -137,6 +144,12 @@ def format_status() -> str:
         f"Sizing  kelly={kelly:.2f} max_pos={max_pos:.0%} "
         f"min_trade=${min_trade:.0f} cap={cap:.0%}",
     ]
+    if bool(_live("ACTIVITY_MANDATE_ENABLED", False)):
+        idle_secs = float(_live("ACTIVITY_IDLE_SECS", 3600.0) or 3600.0)
+        lines.append(f"Activity probe after {idle_secs / 60.0:.0f}m idle")
+    if bool(_live("FILL_QUOTA_ENABLED", False)):
+        n = int(_live("MIN_FILLS_PER_HOUR", 1) or 1)
+        lines.append(f"Fill quota {n}/hour (rank leftover books)")
     return "\n".join(lines)
 
 
@@ -193,6 +206,12 @@ def format_risk() -> str:
             f"Equity DD: {_pct(eq_dd)} (halt @{_pct(float(_live('MAX_DRAWDOWN_PCT', cfg.MAX_DRAWDOWN_PCT)))})",
             f"Daily DD (trading): {_pct(daily_dd)} (halt @{_pct(float(_live('MAX_DAILY_LOSS_PCT', cfg.MAX_DAILY_LOSS_PCT)))})",
             f"Entries paused: {bool(rt.get('entries_paused'))}",
+            (
+                f"Activity: probe after "
+                f"{float(_live('ACTIVITY_IDLE_SECS', 3600.0) or 3600.0) / 60.0:.0f}m idle"
+                if bool(_live("ACTIVITY_MANDATE_ENABLED", False))
+                else "Activity: off"
+            ),
             f"Vault auto: {'on' if vcfg.auto_enabled else 'off'} "
             f"(≥{_money(vcfg.profit_trigger)} profit → skim {_money(vcfg.skim_amount)})",
             f"Skimmable now: {_money(p.skimmable_profit)}",

@@ -72,9 +72,11 @@ c3.metric("Equity", f"${equity:,.0f}", f"{pnl_pct:+.1f}%")
 c4.metric("WR", f"{portfolio.win_rate:.0%}")
 c5.metric("Trades", f"{portfolio.total_trades}")
 if portfolio.halt_state:
-    c6.error(f"HALT")
+    c6.error("HALT")
 else:
     c6.success("OK")
+if portfolio.halt_state and portfolio.halt_reason:
+    st.error(portfolio.halt_reason)
 
 # Log age
 _dec = Path(__file__).resolve().parents[2] / "logs" / "kalshi_decisions.jsonl"
@@ -140,8 +142,8 @@ for asset in assets:
         "Action": action,
         "Reason": reason,
         "Strategy": (s.active_strategy or "—")[:16],
-        "p_mkt": f"{s.p_market:.2f}" if s.p_market is not None else "—",
-        "p_base": f"{s.p_base:.2f}" if s.p_base is not None else "—",
+        "p_mkt": f"{s.p_market * 100:.0f}¢" if s.p_market is not None else "—",
+        "p_base": f"{s.p_base * 100:.0f}¢" if s.p_base is not None else "—",
         "Lag": f"{s.lag_confidence:.2f}",
         "Spot conf": f"{conf:.2f}" if conf > 0 else "—",
         "CWM": f"{cwm:+.3f}" if cwm is not None else "—",
@@ -166,6 +168,7 @@ st.dataframe(
 
 st.caption(
     "Feed: OK ≥0.6 venues · WEAK/BAD low synth confidence · "
+    "p_mkt / p_base are Kalshi YES in cents (69¢ = 0.69) · "
     "CWM = confidence-weighted mispricing · Pos = open side×contracts"
 )
 

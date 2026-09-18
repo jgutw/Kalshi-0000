@@ -74,13 +74,23 @@ class TradingConfig:
     DRAWDOWN_USE_EQUITY: bool   = True
     DAILY_RESET_HOUR_UTC: int   = 0
 
-    # Activity mandate OFF — classic max_risk does not force probe trades
+    # Activity mandate OFF by default. max_risk_micro turns it on at 30m idle
+    # (eases lag/spot/edge, 2.5% probe size). Does not force a trade.
     ACTIVITY_MANDATE_ENABLED: bool = False
     ACTIVITY_IDLE_SECS: float      = 3600.0
     ACTIVITY_PROBE_SIZE_PCT: float = 0.025
     ACTIVITY_EDGE_SCALE: float     = 0.70
     ACTIVITY_SPOT_CONF_FLOOR: float = 0.30
     ACTIVITY_LAG_SCALE: float      = 0.70
+
+    # Fill quota: if the hour/window is empty, rank leftover books and force
+    # one small ticket. Off by default; max_risk_micro / engineered_risk turn it on.
+    # Does not bypass halt, pause, 1¢/99¢, window edge, or venue dislocation.
+    FILL_QUOTA_ENABLED: bool       = False
+    MIN_FILLS_PER_HOUR: int        = 1
+    MIN_FILLS_PER_WINDOW: int      = 0
+    QUOTA_SIZE_PCT: float          = 0.02
+    QUOTA_COLLECT_SECS: float      = 1.2
 
     # Entry gates — loose (lottery tickets allowed, as in R11/R12)
     MIN_ENTRY_PRICE: float      = 0.02
@@ -189,6 +199,11 @@ class TradingConfig:
     LIVE_SETTLE_POLL_SECS: float = 12.0
     LIVE_SYNC_FAIL_HALT: int = 3
     LIVE_MIN_AVAILABLE_USD: float = 2.0
+
+    # Kalshi exchange sharding: crypto 15m markets live on shard 2 (Aug 2026+).
+    # Cash must be preallocated to this shard before live crypto orders fill.
+    CRYPTO_EXCHANGE_INDEX: int = 2
+    CRYPTO_SHARD_RESERVE_USD: float = 0.50   # keep on shard 0 for fees/rounding
 
     # Hard ceiling on the consecutive-loss breaker whenever DRY_RUN is False.
     # start_live_safe() still defaults to max_risk_micro, which carries the

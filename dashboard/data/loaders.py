@@ -137,8 +137,17 @@ def load_portfolio() -> PortfolioSnapshot:
             asset_stats[k] = {"wins": 0, "losses": 0, "total_pnl": 0.0}
 
     vault = _safe_float(data.get("vault_balance"), 0.0)
-    equity = _safe_float(data.get("total_equity"), balance + vault)
+    kalshi_avail = _safe_float(data.get("kalshi_available"), 0.0)
+    kalshi_port = _safe_float(data.get("kalshi_portfolio_value"), 0.0)
+    # Prefer a live mark that includes open event contracts. Persisted
+    # total_equity used to be cash+vault only, which understated live equity
+    # whenever positions were open.
+    equity = balance + vault + max(0.0, kalshi_port)
     skimmable = max(0.0, balance - start)
+
+    live_halt = str(data.get("live_halt_reason") or "").strip()
+    if live_halt:
+        halted, halt_reason = True, live_halt
 
     return PortfolioSnapshot(
         ts=datetime.now(timezone.utc).isoformat(),
@@ -158,11 +167,87 @@ def load_portfolio() -> PortfolioSnapshot:
         vault_balance=vault,
         total_equity=equity,
         skimmable_profit=skimmable,
+        kalshi_available=kalshi_avail,
+        kalshi_portfolio_value=kalshi_port,
     )
 
 
+def _trade_event_from_dict(t: dict) -> TradeEvent:
+    entry = _safe_float(t.get("entry"), 0.5)
+    contracts = int(t.get("contracts", 0) or 0)
+    amount = t.get("amount_usdc")
+    if amount is None:
+        amount = entry * contracts
+    side = (t.get("side") or ("yes" if entry > 0.5 else "no")).lower()
+    return TradeEvent(
+        ts=t.get("ts", ""),
+        asset=t.get("asset", "BTC"),
+        ticker=t.get("ticker", ""),
+        side=side,
+        entry=entry,
+        exit=_safe_float(t.get("exit"), 0.0),
+        contracts=contracts,
+        amount_usdc=_safe_float(amount, entry * contracts),
+        pnl=_safe_float(t.get("pnl"), 0.0),
+        balance=_safe_float(t.get("balance"), 1000.0),
+        win_rate=_safe_float(t.get("win_rate"), 0.0),
+        strategy=t.get("strategy", ""),
+        reason=t.get("reason", ""),
+        time_remaining_at_entry=_safe_float(t.get("time_remaining_at_entry"), 0.0),
+        kalshi_spread_at_entry=_safe_float(t.get("kalshi_spread_at_entry"), 0.0),
+        kalshi_quote_age_at_entry=_safe_float(t.get("kalshi_quote_age_at_entry"), 0.0),
+        spot_confidence_at_entry=_safe_float(t.get("spot_confidence_at_entry"), 0.0),
+        lag_confidence_at_entry=_safe_float(t.get("lag_confidence_at_entry"), 0.0),
+        dislocation_at_entry=_safe_float(t.get("dislocation_at_entry"), 0.0),
+        confidence_weighted_mispricing_at_entry=(
+            t.get("confidence_weighted_mispricing_at_entry")
+            if t.get("confidence_weighted_mispricing_at_entry") is not None
+            else None
+        ),
+    )
+
+
+def load_working_fills() -> List[dict]:
+    """Open tickets from open_positions.json plus kalshi_fills.jsonl (status=open)."""
+    out: list[dict] = []
+    pos_path = LOGS_DIR / "open_positions.json"
+    try:
+        if pos_path.exists() and pos_path.stat().st_size > 0:
+            data = json.loads(pos_path.read_text(encoding="utf-8"))
+            for p in data.get("positions") or []:
+                out.append({
+                    "ts": data.get("ts") or "",
+                    "asset": p.get("asset"),
+                    "ticker": p.get("ticker") or p.get("market_ticker"),
+                    "side": p.get("side"),
+                    "entry": p.get("entry") or p.get("entry_price"),
+                    "contracts": p.get("contracts"),
+                    "amount_usdc": p.get("amount_usdc"),
+                    "status": "open",
+                })
+    except (OSError, json.JSONDecodeError):
+        pass
+    fills_path = LOGS_DIR / "kalshi_fills.jsonl"
+    try:
+        if fills_path.exists():
+            with fills_path.open(encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if rec.get("status") == "open":
+                        out.append(rec)
+    except OSError:
+        pass
+    return out
+
+
 def load_trades() -> List[TradeEvent]:
-    """Load closed trades from kalshi_trades.jsonl.
+    """Load closed trades from kalshi_trades.jsonl, merged with sim.json.
 
     In live mode with no closed trades yet, return [] — never inject mock trades
     (that made the journal disagree with the $500 paper balance).
@@ -170,56 +255,34 @@ def load_trades() -> List[TradeEvent]:
     events: List[TradeEvent] = []
     live = _live_logs_present()
     try:
-        if not TRADES_PATH.exists() or TRADES_PATH.stat().st_size == 0:
+        if TRADES_PATH.exists() and TRADES_PATH.stat().st_size > 0:
+            with open(TRADES_PATH, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        t = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    events.append(_trade_event_from_dict(t))
+        if SIM_PATH.exists():
+            sim = json.loads(SIM_PATH.read_text(encoding="utf-8"))
+            seen = {(e.ts, e.asset, e.ticker, e.contracts) for e in events}
+            for t in sim.get("trades") or []:
+                if not isinstance(t, dict):
+                    continue
+                ev = _trade_event_from_dict(t)
+                key = (ev.ts, ev.asset, ev.ticker, ev.contracts)
+                if key not in seen:
+                    events.append(ev)
+                    seen.add(key)
+        if not events:
             return [] if live else generate_trades()
-        with open(TRADES_PATH, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    t = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                entry = _safe_float(t.get("entry"), 0.5)
-                exit_val = _safe_float(t.get("exit"), 0.0)
-                contracts = int(t.get("contracts", 0) or 0)
-                side = (t.get("side") or ("yes" if entry > 0.5 else "no")).lower()
-                amount = t.get("amount_usdc")
-                if amount is None:
-                    amount = entry * contracts
-                events.append(TradeEvent(
-                    ts=t.get("ts", ""),
-                    asset=t.get("asset", "BTC"),
-                    ticker=t.get("ticker", ""),
-                    side=side,
-                    entry=entry,
-                    exit=exit_val,
-                    contracts=contracts,
-                    amount_usdc=_safe_float(amount, entry * contracts),
-                    pnl=_safe_float(t.get("pnl"), 0.0),
-                    balance=_safe_float(t.get("balance"), 1000.0),
-                    win_rate=_safe_float(t.get("win_rate"), 0.0),
-                    strategy=t.get("strategy", ""),
-                    reason=t.get("reason", ""),
-                    time_remaining_at_entry=_safe_float(t.get("time_remaining_at_entry"), 0.0),
-                    kalshi_spread_at_entry=_safe_float(t.get("kalshi_spread_at_entry"), 0.0),
-                    kalshi_quote_age_at_entry=_safe_float(t.get("kalshi_quote_age_at_entry"), 0.0),
-                    spot_confidence_at_entry=_safe_float(t.get("spot_confidence_at_entry"), 0.0),
-                    lag_confidence_at_entry=_safe_float(t.get("lag_confidence_at_entry"), 0.0),
-                    dislocation_at_entry=_safe_float(t.get("dislocation_at_entry"), 0.0),
-                    confidence_weighted_mispricing_at_entry=(
-                        t.get("confidence_weighted_mispricing_at_entry")
-                        if t.get("confidence_weighted_mispricing_at_entry") is not None
-                        else None
-                    ),
-                ))
-    except IOError:
+        events.sort(key=lambda e: e.ts or "")
+        return events
+    except (IOError, json.JSONDecodeError):
         return [] if live else generate_trades()
-
-    if not events:
-        return [] if live else generate_trades()
-    return events
 
 
 def load_decisions(asset: Optional[str] = None, last_n: int = 500) -> List[DecisionEvent]:

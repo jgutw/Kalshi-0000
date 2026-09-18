@@ -138,6 +138,10 @@ class SimState:
     kalshi_available: float = 0.0
     kalshi_portfolio_value: float = 0.0
 
+    # Hourly fill-quota ranking (not persisted)
+    _quota_bids: dict = field(default_factory=dict, repr=False)
+    _quota_claimed_at: float = field(default=0.0, repr=False)
+
     # ─── Properties ───────────────────────────────────────────────────────────
 
     @property
@@ -162,10 +166,18 @@ class SimState:
     @property
     def total_equity(self) -> float:
         """
-        Trading balance + vault. In live, LiveGuard reserves the vault out of
-        balance, so this stays equal to Kalshi cash instead of double-counting.
+        Trading balance + vault (+ live open mark).
+
+        Paper: balance already is the sim book; vault is reserved out of it.
+        Live: LiveGuard sets balance = Kalshi available minus vault, so
+        balance + vault = cash. Open event contracts are extra
+        (kalshi_portfolio_value). Omit them and Telegram equity collapses to
+        leftover cash whenever tickets are open.
         """
-        return float(self.balance) + float(self.vault_balance)
+        eq = float(self.balance) + float(self.vault_balance)
+        if not cfg.DRY_RUN:
+            eq += max(0.0, float(self.kalshi_portfolio_value or 0.0))
+        return eq
 
     @property
     def peak_drawdown(self) -> float:
@@ -201,6 +213,71 @@ class SimState:
             return False
         idle_for = float(getattr(cfg, "ACTIVITY_IDLE_SECS", 3600.0))
         return self.seconds_since_last_trade() >= idle_for
+
+    @staticmethod
+    def _trade_epoch(trade: dict) -> float:
+        raw = trade.get("ts")
+        if not raw:
+            return 0.0
+        try:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except (TypeError, ValueError):
+            return 0.0
+
+    def fills_last_seconds(
+        self,
+        secs: float,
+        open_positions: Optional[List[OpenPosition]] = None,
+    ) -> int:
+        """Closed trades + still-open entries inside the lookback."""
+        now = time.time()
+        n = 0
+        for t in self.trades:
+            ts = self._trade_epoch(t if isinstance(t, dict) else {})
+            if ts > 0 and (now - ts) <= secs:
+                n += 1
+        for pos in open_positions or []:
+            entered = float(getattr(pos, "entered_at", 0.0) or 0.0)
+            if entered > 0 and (now - entered) <= secs:
+                n += 1
+        return n
+
+    def quota_hungry(self, open_positions: Optional[List[OpenPosition]] = None) -> bool:
+        if not getattr(cfg, "FILL_QUOTA_ENABLED", False):
+            return False
+        need = int(getattr(cfg, "MIN_FILLS_PER_HOUR", 1) or 0)
+        if need <= 0:
+            return False
+        return self.fills_last_seconds(3600.0, open_positions) < need
+
+    def publish_quota_bid(self, symbol: str, score: float) -> None:
+        self._quota_bids[str(symbol)] = (time.time(), float(score))
+
+    def is_winning_quota_bid(self, symbol: str) -> bool:
+        now = time.time()
+        collect = float(getattr(cfg, "QUOTA_COLLECT_SECS", 1.2))
+        fresh = {
+            s: (ts, sc)
+            for s, (ts, sc) in self._quota_bids.items()
+            if now - float(ts) <= collect + 1.5
+        }
+        if str(symbol) not in fresh:
+            return False
+        oldest = min(ts for ts, _ in fresh.values())
+        if now - oldest < collect and len(fresh) < 5:
+            return False
+        best = max(sc for _, sc in fresh.values())
+        return fresh[str(symbol)][1] + 1e-12 >= best
+
+    def try_claim_quota(self) -> bool:
+        now = time.time()
+        if now - float(self._quota_claimed_at or 0.0) < 45.0:
+            return False
+        self._quota_claimed_at = now
+        return True
 
     def _touch_peaks(self) -> None:
         if self.balance > self.peak_balance:

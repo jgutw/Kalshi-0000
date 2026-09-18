@@ -15,6 +15,7 @@ import asyncio
 import sys
 import math
 import time
+from datetime import datetime, timezone
 
 # Windows UTF-8 fix
 if sys.platform == "win32":
@@ -32,7 +33,7 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     status = PASS if ok else FAIL
     suffix = f"  ({detail})" if detail else ""
     print(f"  {status}  {name}{suffix}")
-    results.append(ok)
+    results.append(bool(ok))
 
 
 print("\n=== Kalshi Multi-Asset Bot - Engine Tests ===\n")
@@ -730,6 +731,37 @@ except Exception as e:
     check("Strategy modules and router", False, str(e))
     import traceback
     traceback.print_exc()
+
+# ─── Fill quota ranking ───────────────────────────────────────────────────────
+print("\n[quota] hourly fill rank-and-fire helpers")
+try:
+    from kalshi_bot.sim_state import SimState
+    from kalshi_bot.config import cfg
+    from kalshi_bot.runtime_control import apply_profile
+
+    apply_profile("max_risk_micro")
+    check("max_risk_micro enables fill quota", bool(cfg.FILL_QUOTA_ENABLED))
+    qs = SimState()
+    qs.trades = []
+    check("quota hungry with no fills", qs.quota_hungry([]))
+    now = time.time()
+    qs.trades = [{"ts": datetime.now(timezone.utc).isoformat()}]
+    check("quota satisfied after a fill this hour", not qs.quota_hungry([]))
+    qs.trades = []
+    qs.publish_quota_bid("BTC", 0.10)
+    qs.publish_quota_bid("ETH", 0.40)
+    qs.publish_quota_bid("SOL", 0.20)
+    qs.publish_quota_bid("XRP", 0.05)
+    qs.publish_quota_bid("DOGE", 0.01)
+    # Collect window may still be open; force oldest back so winner can resolve.
+    oldest = min(ts for ts, _ in qs._quota_bids.values()) - (cfg.QUOTA_COLLECT_SECS + 0.01)
+    qs._quota_bids = {s: (oldest, sc) for s, (_, sc) in qs._quota_bids.items()}
+    check("ETH wins quota rank", qs.is_winning_quota_bid("ETH"))
+    check("BTC does not win quota rank", not qs.is_winning_quota_bid("BTC"))
+    check("try_claim_quota first call ok", qs.try_claim_quota())
+    check("try_claim_quota blocks double fire", not qs.try_claim_quota())
+except Exception as e:
+    check("fill quota helpers", False, str(e))
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 print(f"\n{'='*45}")

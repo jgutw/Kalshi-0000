@@ -35,11 +35,13 @@ def _rounds():
 def preflight_account(client: Optional[KalshiClient] = None) -> dict[str, Any]:
     """Read Kalshi cash + open positions (no side effects)."""
     c = client or KalshiClient()
-    detail = c.get_balance_detail()
+    shard = int(getattr(cfg, "CRYPTO_EXCHANGE_INDEX", 2))
+    detail = c.get_balance_detail(exchange_index=shard)
     available = float(detail.get("available") or 0.0)
     portfolio = float(detail.get("portfolio_value") or 0.0)
+    shard_balances = c.get_shard_balances()
     positions = []
-    for m in c.get_market_positions():
+    for m in c.get_market_positions(exchange_index=shard):
         try:
             pos = float(m.get("position_fp") or 0.0)
         except (TypeError, ValueError):
@@ -59,6 +61,8 @@ def preflight_account(client: Optional[KalshiClient] = None) -> dict[str, Any]:
         "total": available + portfolio,
         "open_count": len(positions),
         "opens": positions,
+        "shard_balances": shard_balances,
+        "crypto_shard": shard,
         "bot_running": trading_bot_running(),
         "session_active": session_is_active(),
         "api_ok": bool(detail.get("raw")),
@@ -83,6 +87,9 @@ def start_live_safe(
     *,
     force_with_opens: bool = False,
     session_tag: Optional[str] = None,
+    kelly: Optional[float] = None,
+    max_pos: Optional[float] = None,
+    portfolio_cap: Optional[float] = None,
 ) -> dict[str, Any]:
     """
     Start a LIVE round sized to Kalshi available cash.
@@ -102,17 +109,18 @@ def start_live_safe(
         raise RuntimeError("Bot already running. Send /stop or /pause first.")
 
     stale = cleanup_stale_session()
-    pf = preflight_account()
+    c = KalshiClient()
+    pf = preflight_account(c)
     if not pf.get("api_ok"):
         raise RuntimeError("Cannot reach Kalshi API — fix network, then retry.")
 
-    available = float(pf["available"])
     opens = list(pf.get("opens") or [])
     min_avail = float(getattr(cfg, "LIVE_MIN_AVAILABLE_USD", 2.0))
-
-    if available < min_avail:
+    shard_balances = pf.get("shard_balances") or {}
+    total_cash = sum(float(v) for v in shard_balances.values())
+    if total_cash < min_avail:
         raise RuntimeError(
-            f"Kalshi available ${available:.2f} < min ${min_avail:.2f}. "
+            f"Kalshi total cash ${total_cash:.2f} < min ${min_avail:.2f}. "
             "Fund the account before live."
         )
     if opens and not force_with_opens:
@@ -121,6 +129,19 @@ def start_live_safe(
             f"Kalshi still has {len(opens)} open position(s): {tickers}. "
             "Wait for settlement, or send:\n"
             f"/resume_live {profile} force"
+        )
+
+    # Crypto markets require cash on exchange shard 2 — fund from shard 0 if needed.
+    moved, fund_msg = c.ensure_crypto_shard_funded()
+    if moved > 0:
+        log.warning("Pre-live shard funding: %s", fund_msg)
+    pf = preflight_account(c)
+    available = float(pf["available"])
+    if available < min_avail:
+        shards = pf.get("shard_balances") or {}
+        raise RuntimeError(
+            f"Crypto shard available ${available:.2f} < min ${min_avail:.2f}. "
+            f"Shard balances: {shards}. Fund shard 0 or transfer manually in Kalshi UI."
         )
 
     # Critical: clear leftover /stop queue bits
@@ -144,6 +165,12 @@ def start_live_safe(
         "--profile", profile,
         "--session-tag", tag,
     ]
+    if kelly is not None:
+        cmd.extend(["--kelly", str(kelly)])
+    if max_pos is not None:
+        cmd.extend(["--max-pos", str(max_pos)])
+    if portfolio_cap is not None:
+        cmd.extend(["--portfolio-cap", str(portfolio_cap)])
     logs_dir = PROJECT_ROOT / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     out_path = logs_dir / "bot_stdout.log"
