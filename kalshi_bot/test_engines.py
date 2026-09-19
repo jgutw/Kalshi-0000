@@ -12,6 +12,7 @@ Or from kalshi_bot/ directory:
 """
 
 import asyncio
+import json
 import sys
 import math
 import time
@@ -629,6 +630,139 @@ try:
           has_raw and has_alpha, f"raw_features={has_raw} alpha_micro={has_alpha} reason={d_log.get('reason')}")
 except Exception as e:
     check("MicroAlphaModel/response_gap", False, str(e))
+    import traceback
+    traceback.print_exc()
+
+# ─── 12. Trade-attribution persistence ───────────────────────────────────────
+print("\n[12] Trade attribution persistence")
+try:
+    import kalshi_bot.asset_engine as asset_engine_module
+    import kalshi_bot.sim_state as sim_state_module
+    from kalshi_bot.asset_engine import AssetEngine
+    from kalshi_bot.config import ASSETS
+    from kalshi_bot.kalshi_client import FillResult
+    from kalshi_bot.sim_state import SimState
+
+    class _AttributionKalshi:
+        def __init__(self):
+            self.book_calls = 0
+
+        def get_orderbook(self, ticker):
+            self.book_calls += 1
+            return {"yes": [[0.54, 100]], "no": [[0.43, 100]]}
+
+        def place_market_order(self, ticker, side, count, limit_price):
+            return FillResult(ok=True, fill_count=count, entry_price=limit_price, cost=limit_price * count)
+
+    old_decision_log = asset_engine_module.DECISION_LOG
+    old_fill_log = asset_engine_module.FILL_LOG
+    old_trade_log = sim_state_module.TRADE_LOG
+    old_asset_open = getattr(asset_engine_module, "open", None)
+    old_sim_open = getattr(sim_state_module, "open", None)
+    captured_writes = {"decision": [], "fill": [], "trade": []}
+
+    class _CaptureFile:
+        def __init__(self, bucket):
+            self.bucket = bucket
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def write(self, value):
+            self.bucket.append(value)
+            return len(value)
+
+    def _asset_open(path, *args, **kwargs):
+        bucket = "decision" if str(path) == "attribution_decisions.jsonl" else "fill"
+        return _CaptureFile(captured_writes[bucket])
+
+    def _sim_open(path, *args, **kwargs):
+        return _CaptureFile(captured_writes["trade"])
+
+    try:
+        asset_engine_module.DECISION_LOG = "attribution_decisions.jsonl"
+        asset_engine_module.FILL_LOG = "attribution_fills.jsonl"
+        sim_state_module.TRADE_LOG = "attribution_trades.jsonl"
+        asset_engine_module.open = _asset_open
+        sim_state_module.open = _sim_open
+
+        kalshi_stub = _AttributionKalshi()
+        attribution_sim = SimState()
+        attribution_sim.save = lambda *args, **kwargs: None
+        attribution_eng = AssetEngine(next(a for a in ASSETS if a.symbol == "BTC"), kalshi_stub, attribution_sim)
+        attribution_eng._ticker = "KXBTC15M-ATTRIBUTION"
+        attribution_eng._window_id = 1_700_000_000
+        attribution_eng._price_to_beat = 95_000.0
+
+        book = attribution_eng._last_kalshi_book()
+        check("attribution book snapshot uses one fetch", kalshi_stub.book_calls == 1)
+        check("attribution book derives complementary quotes",
+              all(round(book[key], 6) == value for key, value in {
+                  "yes_bid": 0.54, "yes_ask": 0.57, "no_bid": 0.43,
+                  "no_ask": 0.46, "kalshi_spread": 0.03,
+              }.items()), str(book))
+
+        decision = {
+            "action": "BUY_YES", "size_usd": 10.0, "ev": 0.08,
+            "p_real": 0.62, "p_market": 0.54, "p_base": 0.60,
+            "bias": 0.2, "conviction": 3, "strategy": "lag_arb",
+            "raw_features": {"obi": 0.2, "lag_signal": 0.1},
+            "per_venue_mids": {"coinbase": 95_001.0, "okx": 95_000.0},
+            "per_venue_staleness": {"coinbase": 0.1, "okx": 0.2},
+            "dislocation": 0.00001, "spot_return_1s": 0.0002,
+            "kalshi_prob_change_1s": 0.01, "yes_bid": book["yes_bid"],
+            "yes_ask": book["yes_ask"], "no_bid": book["no_bid"],
+            "no_ask": book["no_ask"], "kalshi_spread": book["kalshi_spread"],
+            "lead_source": "coinbase", "lag_signal": 0.1,
+            "response_gap": 0.003, "response_beta": 0.7,
+            "regime": cfg.CONFIG_PROFILE,
+        }
+        attribution_eng._log_decision(decision, 0.54)
+        check("decision logging does not fetch orderbook again", kalshi_stub.book_calls == 1)
+        decision_row = json.loads(captured_writes["decision"][0])
+        decision_id = decision_row.get("decision_id")
+        check("decision row has opaque decision_id", bool(decision_id))
+
+        attribution_eng._execute(decision, 0.54)
+        fill_row = json.loads(captured_writes["fill"][0])
+        check("fill carries decision_id", fill_row.get("decision_id") == decision_id)
+
+        pos = attribution_eng._open_pos
+        attribution_sim.record(
+            ticker=pos.market_ticker, asset=pos.asset, entry=pos.entry_price,
+            exit_=1.0, contracts=pos.contracts, window_id="2023-11-14 22:13",
+            window_id_ts=pos.window_id,
+            entry_ts=datetime.fromtimestamp(pos.entered_at, tz=timezone.utc).isoformat(),
+            side=pos.side, decision=pos.decision,
+        )
+        trade_row = json.loads(captured_writes["trade"][0])
+        c7 = trade_row.get("decision", {})
+        check("closed trade and C7 carry the same decision_id",
+              trade_row.get("decision_id") == decision_id and c7.get("decision_id") == decision_id)
+        check("closed trade has UTC entry_ts and numeric window_id_ts",
+              trade_row.get("entry_ts", "").endswith("+00:00") and trade_row.get("window_id_ts") == pos.window_id)
+        check("C7 retains gold-list structured fields",
+              c7.get("raw_features") == decision["raw_features"]
+              and c7.get("per_venue_mids") == decision["per_venue_mids"]
+              and c7.get("response_beta") == decision["response_beta"]
+              and c7.get("yes_price_raw") == 0.54)
+    finally:
+        asset_engine_module.DECISION_LOG = old_decision_log
+        asset_engine_module.FILL_LOG = old_fill_log
+        sim_state_module.TRADE_LOG = old_trade_log
+        if old_asset_open is None:
+            delattr(asset_engine_module, "open")
+        else:
+            asset_engine_module.open = old_asset_open
+        if old_sim_open is None:
+            delattr(sim_state_module, "open")
+        else:
+            sim_state_module.open = old_sim_open
+except Exception as e:
+    check("Trade attribution persistence", False, str(e))
     import traceback
     traceback.print_exc()
 

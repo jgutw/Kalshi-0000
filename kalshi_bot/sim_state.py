@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 
@@ -39,7 +39,28 @@ DECISION_SNAPSHOT_FIELDS = (
     "entry_for_size", "is_lottery",
     "portfolio_gross_at_entry", "concurrent_open",
     "size_usd", "price_to_beat_source",
+    "decision_id", "yes_price_raw", "lag_signal", "response_gap", "response_beta",
+    "raw_features", "regime", "per_venue_mids", "per_venue_staleness",
+    "dislocation", "spot_return_1s", "kalshi_prob_change_1s",
+    "yes_bid", "yes_ask", "no_bid", "no_ask", "kalshi_spread", "lead_source",
 )
+
+
+def _json_safe_snapshot(value: Any) -> Any:
+    """Return a JSON-safe C7 value without changing the live decision object."""
+    if isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return round(value, 6)
+    if isinstance(value, dict):
+        return {
+            str(key): safe
+            for key, item in value.items()
+            if (safe := _json_safe_snapshot(item)) is not None
+        }
+    if isinstance(value, (list, tuple)):
+        return [safe for item in value if (safe := _json_safe_snapshot(item)) is not None]
+    return None
 
 
 def _decision_snapshot(decision: dict) -> dict:
@@ -49,10 +70,9 @@ def _decision_snapshot(decision: dict) -> dict:
         val = decision.get(key)
         if val is None:
             continue
-        if isinstance(val, (str, bool, int)):
-            out[key] = val
-        elif isinstance(val, float):
-            out[key] = round(val, 6)
+        safe = _json_safe_snapshot(val)
+        if safe is not None:
+            out[key] = safe
     return out
 
 
@@ -75,6 +95,7 @@ class OpenPosition:
     fees_usdc:      float = 0.0
     order_id:       str = ""
     is_lottery:     bool = False      # entry < LOTTERY_ENTRY_MAX (sleeve accounting)
+    decision_id:    str = ""          # opaque id carried decision → fill → closed trade
     decision:       Optional[dict] = None   # C7 entry snapshot, copied onto the trade row
 
 
@@ -435,6 +456,8 @@ class SimState:
         exit_spot: Optional[float] = None,
         side: Optional[str] = None,
         fees: float = 0.0,
+        window_id_ts: Optional[int] = None,
+        entry_ts: Optional[str] = None,
         skip_balance_apply: bool = False,
         decision: Optional[dict] = None,
     ) -> float:
@@ -456,6 +479,8 @@ class SimState:
             "pnl":      round(pnl, 4),
             "strategy": strategy,
             "window_id": window_id,
+            "window_id_ts": window_id_ts,
+            "entry_ts": entry_ts,
             "price_to_beat": price_to_beat,
             "exit_spot": exit_spot,
             "side":     side,
@@ -463,6 +488,8 @@ class SimState:
         }
         # C7: attach the entry-time decision context so every closed trade can be
         # attributed offline without joining against kalshi_decisions.jsonl.
+        if decision:
+            trade["decision_id"] = str(decision.get("decision_id") or "")
         if decision and getattr(cfg, "DECISION_SNAPSHOT_ENABLED", True):
             trade["decision"] = _decision_snapshot(decision)
         self.trades.append(trade)
@@ -552,6 +579,10 @@ class SimState:
             }
             if not out.get("window_id"):
                 out.pop("window_id", None)
+            if out.get("window_id_ts") is None:
+                out.pop("window_id_ts", None)
+            if out.get("entry_ts") is None:
+                out.pop("entry_ts", None)
             if out.get("price_to_beat") is None:
                 out.pop("price_to_beat", None)
             if out.get("exit_spot") is None:

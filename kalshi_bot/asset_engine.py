@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import time
+import uuid
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,6 +56,7 @@ log = logging.getLogger("asset_engine")
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DECISION_LOG = str(_PROJECT_ROOT / "logs" / "kalshi_decisions.jsonl")
 WINDOW_LOG = str(_PROJECT_ROOT / "logs" / "kalshi_windows.jsonl")
+FILL_LOG = str(_PROJECT_ROOT / "logs" / "kalshi_fills.jsonl")
 
 
 def _tf_log_fields(tf) -> dict:
@@ -186,10 +188,17 @@ class AssetEngine:
             return 999.0
         return time.time() - self._last_price_ts
 
-    def _last_kalshi_spread(self) -> float:
-        """Kalshi orderbook spread in probability units."""
+    def _last_kalshi_book(self) -> dict:
+        """Fetch one Kalshi book snapshot for routing and attribution."""
+        empty = {
+            "yes_bid": None,
+            "yes_ask": None,
+            "no_bid": None,
+            "no_ask": None,
+            "kalshi_spread": None,
+        }
         if not self._ticker:
-            return 0.0
+            return empty
         try:
             book = self.kalshi.get_orderbook(self._ticker)
             yes_bids = book.get("yes", [])
@@ -205,11 +214,48 @@ class AssetEngine:
             best_no_bid = max((_px(r) for r in no_bids), default=0.0)
             # orderbook_fp is decimal 0–1 (not integer cents)
             best_yes_ask = 1.0 - best_no_bid if best_no_bid > 0 else 1.0
-            if best_yes_bid > 0 and best_yes_ask < 1.0:
-                return max(0.0, best_yes_ask - best_yes_bid)
+            best_no_ask = 1.0 - best_yes_bid if best_yes_bid > 0 else 1.0
+            spread = (
+                max(0.0, best_yes_ask - best_yes_bid)
+                if best_yes_bid > 0 and best_yes_ask < 1.0
+                else None
+            )
+            return {
+                "yes_bid": best_yes_bid or None,
+                "yes_ask": best_yes_ask if best_no_bid > 0 else None,
+                "no_bid": best_no_bid or None,
+                "no_ask": best_no_ask if best_yes_bid > 0 else None,
+                "kalshi_spread": spread,
+            }
         except Exception:
             pass
-        return 0.0
+        return empty
+
+    def _last_kalshi_spread(self) -> float:
+        """Compatibility wrapper for callers that need only the spread."""
+        return self._last_kalshi_book().get("kalshi_spread") or 0.0
+
+    def _add_attribution_fields(self, d: dict, snapshot: dict, raw_features: Optional[dict] = None) -> dict:
+        """Attach existing post-gate observations without recomputing signals."""
+        d.update({
+            "per_venue_mids": snapshot["per_venue_mids"],
+            "per_venue_staleness": snapshot["per_venue_staleness"],
+            "dislocation": snapshot["dislocation"],
+            "spot_return_1s": snapshot["spot_return_1s"],
+            "kalshi_prob_change_1s": snapshot["kalshi_prob_change_1s"],
+            "yes_bid": snapshot["yes_bid"],
+            "yes_ask": snapshot["yes_ask"],
+            "no_bid": snapshot["no_bid"],
+            "no_ask": snapshot["no_ask"],
+            "kalshi_spread": snapshot["kalshi_spread"],
+            "lead_source": self.synthetic_spot.lead_source,
+            "response_gap": self.lag_tracker.response_gap,
+            "response_beta": self.lag_tracker.response_beta,
+            "regime": cfg.CONFIG_PROFILE,
+        })
+        if raw_features is not None:
+            d["raw_features"] = raw_features
+        return d
 
     def _kalshi_prob_change_1s(self) -> float:
         """Kalshi prob now minus ~1s ago."""
@@ -403,6 +449,8 @@ class AssetEngine:
             exit_=exit_price,
             contracts=pos.contracts,
             window_id=window_id_str,
+            window_id_ts=pos.window_id,
+            entry_ts=datetime.fromtimestamp(pos.entered_at, tz=timezone.utc).isoformat(),
             price_to_beat=ptb,
             exit_spot=exit_spot,
             side=pos.side,
@@ -479,6 +527,8 @@ class AssetEngine:
             contracts=pos.contracts,
             strategy="early_exit",
             window_id=_fmt_window_id(pos.window_id),
+            window_id_ts=pos.window_id,
+            entry_ts=datetime.fromtimestamp(pos.entered_at, tz=timezone.utc).isoformat(),
             price_to_beat=ptb,
             exit_spot=float(spot),
             side=pos.side,
@@ -837,6 +887,7 @@ class AssetEngine:
         sm = self.synthetic_spot.spot_mid
         if sm and sm > 0:
             self._spot_history.append((time.time(), sm))
+        kalshi_book = self._last_kalshi_book()
         snapshot = {
             "p_base":                          tf.p_base,
             "p_market":                        p_market,
@@ -845,7 +896,11 @@ class AssetEngine:
             "confidence_weighted_mispricing":  tf.confidence_weighted_mispricing,
             "z_threshold":                     tf.z_threshold,
             "kalshi_quote_age_secs":           self._last_price_age(),
-            "kalshi_spread":                   self._last_kalshi_spread(),
+            "kalshi_spread":                   kalshi_book["kalshi_spread"] or 0.0,
+            "yes_bid":                         kalshi_book["yes_bid"],
+            "yes_ask":                         kalshi_book["yes_ask"],
+            "no_bid":                          kalshi_book["no_bid"],
+            "no_ask":                          kalshi_book["no_ask"],
             "dislocation":                     self.synthetic_spot.dislocation,
             "time_remaining_secs":             time_remaining,
             "per_venue_mids":                  self.synthetic_spot.venue_mids(),
@@ -854,6 +909,7 @@ class AssetEngine:
             "kalshi_prob_change_1s":           self._kalshi_prob_change_1s(),
             "spot_return_1s":                  self._spot_return_1s(),
         }
+        attribution_fields = self._add_attribution_fields({}, snapshot, raw_features)
         signal = self.router.route(snapshot)
         if signal.action == "WAIT":
             # Optional secondary path — disabled under higher_sharpe (R8: majority of losing entries)
@@ -876,16 +932,16 @@ class AssetEngine:
                 d.update(_tf_log_fields(tf))
                 d["strategy"] = signal.strategy
                 d["diagnostics"] = signal.diagnostics
-                d["raw_features"] = raw_features
                 d["alpha_micro"] = alpha_micro
+                d.update(attribution_fields)
                 return d
             else:
                 d = self._wait(signal.reason, yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
                 d.update(_tf_log_fields(tf))
                 d["strategy"] = signal.strategy
                 d["diagnostics"] = signal.diagnostics
-                d["raw_features"] = raw_features
                 d["alpha_micro"] = alpha_micro
+                d.update(attribution_fields)
                 return d
         else:
             action = signal.action
@@ -893,22 +949,30 @@ class AssetEngine:
             signal_strategy = signal.strategy
 
         if abs(ev) < min_edge:
-            return self._wait(f"edge({ev:+.3f}<{min_edge:.3f})", yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
+            d = self._wait(f"edge({ev:+.3f}<{min_edge:.3f})", yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
+            d.update(attribution_fields)
+            return d
 
         conv = self.signal.conviction()
         if conv < cfg.MIN_CONVICTION:
-            return self._wait(f"conviction({conv}<{cfg.MIN_CONVICTION})", yes_price_raw)
+            d = self._wait(f"conviction({conv}<{cfg.MIN_CONVICTION})", yes_price_raw)
+            d.update(attribution_fields)
+            return d
 
         # Lag gate: only lag_arb requires detectable Kalshi lag (strategy already checks in lag_arb.py)
         lag_conf = self.lag_tracker.lag_confidence
         if signal_strategy == "lag_arb" and lag_conf < lag_absent_min:
-            return self._wait(f"lag_absent({lag_conf:.2f})", yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
+            d = self._wait(f"lag_absent({lag_conf:.2f})", yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
+            d.update(attribution_fields)
+            return d
 
         # Sharpe gate (after enough trades to be meaningful)
         if (self.sim.total_trades >= cfg.SHARPE_MIN_TRADES
                 and len(self.sim.returns_hist) >= 10):
             if self.sim.current_sharpe < cfg.SHARPE_MIN:
-                return self._wait(f"sharpe({self.sim.current_sharpe:.2f}<{cfg.SHARPE_MIN})", yes_price_raw, spot_now=spot_now, spot_start=spot_start)
+                d = self._wait(f"sharpe({self.sim.current_sharpe:.2f}<{cfg.SHARPE_MIN})", yes_price_raw, spot_now=spot_now, spot_start=spot_start)
+                d.update(attribution_fields)
+                return d
 
         # Kelly sizing + variance-aware shrink (extreme entries / noisy belief)
         if ev > 0:
@@ -962,18 +1026,24 @@ class AssetEngine:
                     if e._open_pos is not None and getattr(e._open_pos, "is_lottery", False)
                 )
                 if open_lotto >= max_lotto:
-                    return self._wait(
+                    d = self._wait(
                         f"lottery_sleeve_full({open_lotto}/{max_lotto})",
                         yes_price_raw, p_base=p_base, alpha_micro=alpha_micro,
                         spot_now=spot_now, spot_start=spot_start,
                     )
+                    d.update(attribution_fields)
+                    return d
 
         ok, reason = self.sim.can_trade(size_usd, abs(ev), min_edge, asset=self.spec.symbol)
         if not ok:
-            return self._wait(reason, yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
+            d = self._wait(reason, yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
+            d.update(attribution_fields)
+            return d
 
         if size_usd < cfg.MIN_TRADE_USD:
-            return self._wait(f"size_too_small(${size_usd:.2f})", yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
+            d = self._wait(f"size_too_small(${size_usd:.2f})", yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
+            d.update(attribution_fields)
+            return d
 
         if activity_probe:
             idle_m = self.sim.seconds_since_last_trade() / 60.0
@@ -996,7 +1066,6 @@ class AssetEngine:
             "spot_start":    spot_start,
             "strategy":      ("activity_probe+" + signal_strategy) if activity_probe else signal_strategy,
             "diagnostics":   signal.diagnostics,
-            "raw_features":  raw_features,
             "alpha_micro":   alpha_micro,
             "z_threshold":   tf.z_threshold,
             "mispricing_base": tf.mispricing_base,
@@ -1018,6 +1087,7 @@ class AssetEngine:
             "concurrent_open":      concurrent_open,
             "min_edge":             min_edge,
             "realized_vol":         rv,
+            **attribution_fields,
         }
 
     # ─── Execution ────────────────────────────────────────────────────────────
@@ -1084,6 +1154,7 @@ class AssetEngine:
             entered_at    = time.time(),
             price_to_beat = self._price_to_beat,
             is_lottery    = bool(d.get("is_lottery")),
+            decision_id   = str(d.get("decision_id") or ""),
             decision      = dict(d),
         )
         fill = self.kalshi.place_market_order(
@@ -1119,6 +1190,7 @@ class AssetEngine:
             fees_usdc     = fill_fees,
             order_id      = str(getattr(fill, "order_id", "") or ""),
             is_lottery    = bool(d.get("is_lottery")),
+            decision_id   = str(d.get("decision_id") or ""),
             decision      = dict(d),
         )
         if not cfg.DRY_RUN:
@@ -1159,11 +1231,12 @@ class AssetEngine:
             "strategy": d.get("strategy") or "",
             "p_market": d.get("p_market"),
             "window_id": self._window_id,
+            "decision_id": str(getattr(self._open_pos, "decision_id", "") or d.get("decision_id") or ""),
         }
-        path = Path(__file__).resolve().parent.parent / "logs" / "kalshi_fills.jsonl"
+        path = Path(FILL_LOG)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as f:
+            with open(FILL_LOG, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec) + "\n")
         except OSError as e:
             log.warning("fill log write failed: %s", e)
@@ -1323,6 +1396,12 @@ class AssetEngine:
 
     def _log_decision(self, d: dict, yes_price_raw: float) -> None:
         try:
+            # One opaque identifier per decision event. `_log_decision` runs before
+            # `_execute`, so the same id is carried through the position and fill.
+            decision_id = str(d.get("decision_id") or uuid.uuid4().hex)
+            d["decision_id"] = decision_id
+            d["yes_price_raw"] = yes_price_raw
+            d.setdefault("regime", cfg.CONFIG_PROFILE)
             # Fill spot_now from dict or best available (synthetic_spot > signal.prices)
             spot_now = d.get("spot_now")
             if spot_now is None:
@@ -1338,6 +1417,7 @@ class AssetEngine:
                 "window_id":    _fmt_window_id(self._window_id) if self._window_id > 0 else "",
                 "window_id_ts": self._window_id,
                 "ticker":       self._ticker,
+                "decision_id":  decision_id,
                 "price_to_beat": self._price_to_beat,
                 "yes_price_raw": yes_price_raw,
                 "action":       d["action"],
@@ -1365,6 +1445,20 @@ class AssetEngine:
                 "time_remaining": d.get("time_remaining"),
                 "dist_from_threshold": d.get("dist_from_threshold"),
                 "lag_signal":   d.get("lag_signal"),
+                "response_gap": d.get("response_gap"),
+                "response_beta": d.get("response_beta"),
+                "regime":       d.get("regime"),
+                "lead_source":  d.get("lead_source"),
+                "per_venue_mids": d.get("per_venue_mids"),
+                "per_venue_staleness": d.get("per_venue_staleness"),
+                "dislocation":  d.get("dislocation"),
+                "spot_return_1s": d.get("spot_return_1s"),
+                "kalshi_prob_change_1s": d.get("kalshi_prob_change_1s"),
+                "yes_bid":      d.get("yes_bid"),
+                "yes_ask":      d.get("yes_ask"),
+                "no_bid":       d.get("no_bid"),
+                "no_ask":       d.get("no_ask"),
+                "kalshi_spread": d.get("kalshi_spread"),
                 "signals":      self.signal.get_components(),
             }
             Path(DECISION_LOG).parent.mkdir(parents=True, exist_ok=True)

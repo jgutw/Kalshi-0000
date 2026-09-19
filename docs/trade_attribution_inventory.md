@@ -1,8 +1,9 @@
-# Trade Attribution — Phase 1 inventory
+# Trade Attribution — Phase 2 inventory
 
-**Scope:** source-only inventory for a later, separately approved persistence
-change. This is a candidate map for research questions, **not** a 40-column
-target schema. No decision, sizing, order, or logging behavior was changed.
+**Scope:** inventory and implementation record for the bounded Phase 2
+observability change. This is a candidate map for research questions, **not** a
+40-column target schema. Strategy logic, sizing, gates, signal math, and order
+execution behavior were not changed.
 
 ## Current recording surfaces
 
@@ -13,11 +14,34 @@ target schema. No decision, sizing, order, or logging behavior was changed.
 - `kalshi_events.jsonl` receives only the currently submitted raw event shape
   (here, the Kalshi price tick). The recorder adds `ts_local` as a Unix epoch.
 - C7 attaches `DECISION_SNAPSHOT_FIELDS` from the entry decision as a nested
-  `decision` object on each closed `kalshi_trades.jsonl` row. This is the
-  strongest current trade-attribution surface.
-- `kalshi_fills.jsonl` records successful open fills only; `kalshi_windows.jsonl`
-  records one end-of-window summary based on the *last* decision row, not
-  necessarily the entry decision.
+  `decision` object on each closed `kalshi_trades.jsonl` row. Phase 2 also
+  copies the opaque `decision_id` onto the closed trade.
+- `kalshi_fills.jsonl` records successful open fills only and now carries the
+  same `decision_id`; `kalshi_windows.jsonl` remains an end-of-window summary
+  based on the *last* decision row, not necessarily the entry decision.
+
+## Phase 2 implemented fields
+
+Phase 2 uses the existing decision, fill, and C7 persistence surfaces. Each
+decision row receives one opaque `decision_id`, which is propagated through the
+open position, fill row, C7 entry snapshot, and closed-trade row. Entry and
+close records also retain UTC `entry_ts` and numeric `window_id_ts` where the
+recording surface supports them.
+
+The decision and C7 snapshot now include the selected attribution gold list:
+
+- Kalshi `yes_bid`, `yes_ask`, `no_bid`, `no_ask`, and `kalshi_spread`.
+- Lag and response fields: `lag_signal`, `response_gap`, and `response_beta`.
+- Regime and lead-source context: `regime`, `lead_source`,
+  `per_venue_mids`, and `per_venue_staleness`.
+- Spot and market-response context: `dislocation`, `spot_return_1s`, and
+  `kalshi_prob_change_1s`.
+- Existing `raw_features` are retained in the JSON-safe C7 snapshot so the
+  closed trade can be analyzed without an ambiguous decision-row join.
+
+The implementation derives complementary YES/NO quotes from the single
+order-book fetch already used for the decision. It does not add a parallel
+logger, perform another order-book fetch, or make the candidate list mandatory.
 
 ## Candidate research fields
 
@@ -96,9 +120,14 @@ list mandatory.
    20,000 rows; events retain 5,000. Any later study requiring full rounds must
    account for that independently of field selection.
 
-## Phase 2 boundary (not implemented)
+## Phase 2 boundary
 
-Choose a small gold list from the rows above, then persist it on the existing
-decision row (therefore its existing `kalshi_features.jsonl` clone) and where
-needed on C7's nested `decision` snapshot. Keep the old schema for the current
-round; begin any new fields only after the next deliberate process start.
+The bounded gold list above is implemented on the existing decision row
+(therefore its existing `kalshi_features.jsonl` clone) and, where needed, on
+C7's nested `decision` snapshot. Fields absent from the candidate inventory,
+including `lag_zscore`, ordinal `venue_1`–`venue_4`, MAE/MFE, and acceleration,
+remain intentionally unimplemented because they require new definitions rather
+than passive persistence.
+
+The new schema becomes the research dataset only after a deliberate process
+restart. Existing records retain their prior schema.
