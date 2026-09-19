@@ -21,6 +21,7 @@ btc5m_decisions.jsonl
 
 # Generated reports & run noise
 reports/
+research_data/
 *.xlsx
 run_*.txt
 run_log.txt

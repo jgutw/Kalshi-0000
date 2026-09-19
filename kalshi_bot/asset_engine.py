@@ -30,6 +30,7 @@ from .config import cfg, AssetSpec, BLACKOUT_WINDOWS, BLACKOUT_HALF_WIDTH_SECS
 
 if TYPE_CHECKING:
     from .recorder import EventRecorder
+    from .research_store import ResearchForecastStore
 from .kalshi_client import KalshiClient
 from .lag_tracker import KalshiLagTracker
 from .prob_model import SECONDS_PER_YEAR
@@ -125,12 +126,14 @@ class AssetEngine:
         sim: SimState,
         recorder: Optional["EventRecorder"] = None,
         on_window_close: Optional[Callable[[str, str, float, float, str, int, float], None]] = None,
+        research_store: Optional["ResearchForecastStore"] = None,
     ):
         self.spec   = spec
         self.kalshi = kalshi
         self.sim    = sim
         self.recorder = recorder
         self._on_window_close = on_window_close
+        self.research_store = research_store
 
         self.signal       = AssetSignalEngine(spec.symbol)
         self.tracker      = LogitPriceTracker()
@@ -332,6 +335,15 @@ class AssetEngine:
                 window_pnl=window_pnl,
                 trade_snap=trade_snap,
             )
+            if self.research_store:
+                try:
+                    self.research_store.finalize(
+                        asset=self.spec.symbol, closed_window_id_ts=closed_wid,
+                        actual_outcome=outcome, exit_spot=exit_spot,
+                        close_time_utc=self._close_time_utc,
+                    )
+                except Exception as e:
+                    log.warning("Research finalize hook failed: %s", e)
             if self._on_window_close:
                 self._on_window_close(
                     _fmt_window_id(closed_wid), self.spec.symbol,
@@ -1461,6 +1473,11 @@ class AssetEngine:
                 "kalshi_spread": d.get("kalshi_spread"),
                 "signals":      self.signal.get_components(),
             }
+            if self.research_store:
+                try:
+                    self.research_store.observe(rec)
+                except Exception as e:
+                    log.warning("Research observe hook failed: %s", e)
             Path(DECISION_LOG).parent.mkdir(parents=True, exist_ok=True)
             rotate_log_if_needed(DECISION_LOG, DECISIONS_MAX_LINES, DECISIONS_KEEP_LINES)
             with open(DECISION_LOG, "a", encoding="utf-8") as f:

@@ -47,6 +47,7 @@ from .sim_state import SimState
 from .live_guard import LiveGuard
 from .asset_engine import AssetEngine
 from .recorder import EventRecorder
+from .research_store import ResearchForecastStore
 from .data.coinbase_feed import run_coinbase_microstructure as run_coinbase_microstructure_feed
 from .data.kraken_feed import run_kraken as run_kraken_feed
 from .data.gemini_feed import run_gemini as run_gemini_feed
@@ -106,6 +107,9 @@ class KalshiMultiBot:
         else:
             self.sim.save()  # ensure dashboard has valid file from startup
         self.recorder = EventRecorder()
+        self.research_store = ResearchForecastStore(
+            dry_run=cfg.DRY_RUN, config_profile=cfg.CONFIG_PROFILE,
+        )
         self.engines: Dict[str, AssetEngine] = {}
         self.live_guard: LiveGuard | None = None
 
@@ -128,6 +132,7 @@ class KalshiMultiBot:
                     spec, self.kalshi, self.sim,
                     recorder=self.recorder,
                     on_window_close=on_window_close,
+                    research_store=self.research_store,
                 )
 
         for engine in self.engines.values():
