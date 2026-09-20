@@ -185,6 +185,7 @@ class AssetEngine:
         # Per-decision observability only. Reset at the beginning of make_decision
         # and copied to the research record; never consulted by trading logic.
         self._research_structural_fields: Optional[dict] = None
+        self._research_tf_log_fields: Optional[dict] = None
 
     # ─── Strategy snapshot helpers ────────────────────────────────────────────
 
@@ -670,6 +671,7 @@ class AssetEngine:
 
     def make_decision(self, yes_price_raw: float) -> dict:
         self._research_structural_fields = None
+        self._research_tf_log_fields = None
         # Telegram / dashboard pause — block new entries only
         try:
             from .runtime_control import entries_paused
@@ -802,6 +804,10 @@ class AssetEngine:
             spot_confidence=self.synthetic_spot.confidence,
             lag_confidence=self.lag_tracker.lag_confidence,
         )
+        # Retain the exact already-computed feature values for observational
+        # logging on any subsequent WAIT return.  This does not participate in
+        # routing or recalculate threshold features.
+        self._research_tf_log_fields = _tf_log_fields(tf)
 
         if tf.p_base is None:
             d = self._wait("structural_prob_invalid", yes_price_raw, spot_now=spot_now, spot_start=spot_start)
@@ -1354,6 +1360,8 @@ class AssetEngine:
             out["spot_start"] = spot_start
         if self._research_structural_fields:
             out.update(self._research_structural_fields)
+        if self._research_tf_log_fields:
+            out.update(self._research_tf_log_fields)
         forced = self._try_quota_override(out, yes_price, p_base, p_real)
         return forced if forced is not None else out
 
@@ -1462,6 +1470,12 @@ class AssetEngine:
                 elif self.signal.prices:
                     spot_now = float(self.signal.prices[-1])
             spot_start = d.get("spot_start") if d.get("spot_start") is not None else self._price_to_beat
+            # Router calculations intentionally use a 0.0 fallback when the
+            # book is absent. Persist absence as null instead of representing
+            # that fallback as an observed zero spread.
+            research_kalshi_spread = d.get("kalshi_spread")
+            if all(d.get(field) is None for field in ("yes_bid", "yes_ask", "no_bid", "no_ask")):
+                research_kalshi_spread = None
             rec = {
                 "ts":           datetime.now(timezone.utc).isoformat(),
                 "asset":        self.spec.symbol,
@@ -1509,7 +1523,7 @@ class AssetEngine:
                 "yes_ask":      d.get("yes_ask"),
                 "no_bid":       d.get("no_bid"),
                 "no_ask":       d.get("no_ask"),
-                "kalshi_spread": d.get("kalshi_spread"),
+                "kalshi_spread": research_kalshi_spread,
                 "quote_age_secs": d.get("quote_age_secs"),
                 "fresh_venue_count": d.get("fresh_venue_count"),
                 "raw_tte": d.get("raw_tte"),

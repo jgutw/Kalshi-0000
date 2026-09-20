@@ -725,6 +725,39 @@ try:
         decision_row = json.loads(captured_writes["decision"][0])
         decision_id = decision_row.get("decision_id")
         check("decision row has opaque decision_id", bool(decision_id))
+        check("observed quotes preserve their real spread",
+              decision_row.get("kalshi_spread") == book["kalshi_spread"])
+
+        # The router's 0.0 fallback must remain usable in memory, but must not
+        # be persisted as a quote when no book quote exists.
+        unavailable_book_decision = dict(decision)
+        unavailable_book_decision.pop("decision_id", None)
+        unavailable_book_decision.update({
+            "yes_bid": None, "yes_ask": None, "no_bid": None, "no_ask": None,
+            "kalshi_spread": 0.0,
+        })
+        attribution_eng._log_decision(unavailable_book_decision, 0.54)
+        unavailable_book_row = json.loads(captured_writes["decision"][-1])
+        check("unavailable quotes persist null spread without another fetch",
+              unavailable_book_decision["kalshi_spread"] == 0.0
+              and unavailable_book_row.get("kalshi_spread") is None
+              and kalshi_stub.book_calls == 1)
+
+        # Post-structural WAIT paths reuse the already-computed threshold
+        # features exactly; they do not make a second feature/volatility call.
+        attribution_eng._research_tf_log_fields = {
+            "z_threshold": 0.37,
+            "p_base": 0.61,
+            "mispricing_base": 0.11,
+            "confidence_weighted_mispricing": 0.05,
+            "spot_confidence": 0.82,
+            "lag_confidence": 0.73,
+        }
+        for wait_reason in ("p_real_near_50", "edge_too_small", "entry_too_cheap", "portfolio_cap"):
+            wait = attribution_eng._wait(wait_reason, 0.54, p_base=0.61, alpha_micro=0.0)
+            check(f"post-structural {wait_reason} WAIT retains exact threshold fields",
+                  all(wait.get(field) == value for field, value in attribution_eng._research_tf_log_fields.items()))
+        attribution_eng._research_tf_log_fields = None
 
         attribution_eng._execute(decision, 0.54)
         fill_row = json.loads(captured_writes["fill"][0])
