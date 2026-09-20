@@ -117,18 +117,22 @@ def main() -> None:
         decision_path = engine_module.DECISION_LOG
         try:
             engine_module.DECISION_LOG = str(root / "temporary_decisions.jsonl")
-            observed = []
+            observed = []; boundary_observed = []
             class Hook:
                 def observe(self, value): observed.append(value.copy())
+                def observe_boundary(self, value): boundary_observed.append(value.copy())
                 def finalize(self, **kwargs): pass
+                def finalize_boundary_window(self, **kwargs): pass
             engine = AssetEngine(next(asset for asset in ASSETS if asset.symbol == "BTC"), KalshiClient(), SimState(), research_store=Hook())
             engine._window_id, engine._ticker = 1722482100, "KXBTC"
-            before = {"action": "WAIT", "p_real": .5, "p_base": .5, "time_remaining": 90}
+            before = {"action": "WAIT", "p_real": .5, "p_base": .5, "time_remaining": 90,
+                      "raw_tte": 91, "tau_used": 91, "realized_vol_value": .3, "sigma_used": .3}
             engine._log_decision(before, .5)
             check("research hook observes complete rec without decision change", len(observed) == 1 and observed[0]["p_real"] == .5 and before["action"] == "WAIT")
+            check("boundary hook receives existing structural values without decision change", len(boundary_observed) == 1 and boundary_observed[0]["raw_tte"] == 91 and boundary_observed[0]["sigma_used"] == .3 and boundary_observed[0]["p_market_semantics"] == "raw_WAIT")
         finally:
             engine_module.DECISION_LOG = decision_path
-    print("19/19 research-store fixture checks passed")
+    print("20/20 research-store fixture checks passed")
 
 
 if __name__ == "__main__":

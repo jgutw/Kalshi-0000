@@ -182,6 +182,9 @@ class AssetEngine:
         self._last_p_base_window_id: int = -1
         self._last_decision: Optional[dict] = None  # latest decision row (for window summary)
         self._window_fills: list = []  # fills closed during current window (incl. early exit)
+        # Per-decision observability only. Reset at the beginning of make_decision
+        # and copied to the research record; never consulted by trading logic.
+        self._research_structural_fields: Optional[dict] = None
 
     # ─── Strategy snapshot helpers ────────────────────────────────────────────
 
@@ -251,7 +254,9 @@ class AssetEngine:
             "no_bid": snapshot["no_bid"],
             "no_ask": snapshot["no_ask"],
             "kalshi_spread": snapshot["kalshi_spread"],
+            "quote_age_secs": snapshot["kalshi_quote_age_secs"],
             "lead_source": self.synthetic_spot.lead_source,
+            "fresh_venue_count": getattr(self.synthetic_spot, "source_count", None),
             "response_gap": self.lag_tracker.response_gap,
             "response_beta": self.lag_tracker.response_beta,
             "regime": cfg.CONFIG_PROFILE,
@@ -344,11 +349,30 @@ class AssetEngine:
                     )
                 except Exception as e:
                     log.warning("Research finalize hook failed: %s", e)
+                try:
+                    self.research_store.finalize_boundary_window(
+                        asset=self.spec.symbol, closed_window_id_ts=closed_wid,
+                        actual_outcome=outcome, exit_spot=exit_spot,
+                        close_time_utc=self._close_time_utc, ticker=self._ticker,
+                    )
+                except Exception as e:
+                    log.warning("Boundary research finalize hook failed: %s", e)
             if self._on_window_close:
                 self._on_window_close(
                     _fmt_window_id(closed_wid), self.spec.symbol,
                     price_to_beat, exit_spot, outcome, trade_count, window_pnl,
                 )
+        elif closed_wid > 0 and self.research_store:
+            # No valid close outcome is available, but valid pre-horizon feature
+            # candidates must not leak into a later window.
+            try:
+                self.research_store.finalize_boundary_window(
+                    asset=self.spec.symbol, closed_window_id_ts=closed_wid,
+                    actual_outcome=None, exit_spot=exit_spot,
+                    close_time_utc=self._close_time_utc, ticker=self._ticker,
+                )
+            except Exception as e:
+                log.warning("Boundary research cleanup hook failed: %s", e)
         self._window_id    = wid
         self._window_start = float(wid)
         self._last_decision = None
@@ -645,6 +669,7 @@ class AssetEngine:
     # ─── Decision ─────────────────────────────────────────────────────────────
 
     def make_decision(self, yes_price_raw: float) -> dict:
+        self._research_structural_fields = None
         # Telegram / dashboard pause — block new entries only
         try:
             from .runtime_control import entries_paused
@@ -700,7 +725,8 @@ class AssetEngine:
             return self._wait(f"vol_too_high({rv:.2f})", yes_price_raw)
 
         # Get spot_now early (needed for structural model)
-        time_remaining = self._time_remaining_secs()
+        raw_tte = self._time_remaining_secs()
+        time_remaining = raw_tte
         sm = self.synthetic_spot.spot_mid
         if sm is not None and sm > 0:
             spot_now = float(sm)
@@ -766,11 +792,12 @@ class AssetEngine:
             min_edge *= float(getattr(cfg, "ACTIVITY_EDGE_SCALE", 0.70))
 
         # Threshold features (central ranking signal)
+        structural_rv = self.signal.get_realized_vol()
         tf = compute_threshold_features(
             spot_now=spot_now,
             spot_start=spot_start,
             time_remaining_secs=time_remaining,
-            annualized_vol=self.signal.get_realized_vol(),
+            annualized_vol=structural_rv,
             p_market=p_market,
             spot_confidence=self.synthetic_spot.confidence,
             lag_confidence=self.lag_tracker.lag_confidence,
@@ -780,6 +807,15 @@ class AssetEngine:
             d = self._wait("structural_prob_invalid", yes_price_raw, spot_now=spot_now, spot_start=spot_start)
             d.update(_tf_log_fields(tf))
             return d
+
+        self._research_structural_fields = {
+            "raw_tte": raw_tte,
+            "tau_used": time_remaining,
+            # This is the exact return from production's existing volatility call;
+            # 0.3 may be its fallback, not necessarily an observed estimate.
+            "realized_vol_value": structural_rv,
+            "sigma_used": max(structural_rv, cfg.MIN_STRUCTURAL_VOL),
+        }
 
         # Diagnostic: time_remaining, tau, vol, z for debugging (DEBUG to avoid log spam)
         tau = time_remaining / (365 * 24 * 3600)
@@ -1099,6 +1135,7 @@ class AssetEngine:
             "concurrent_open":      concurrent_open,
             "min_edge":             min_edge,
             "realized_vol":         rv,
+            **self._research_structural_fields,
             **attribution_fields,
         }
 
@@ -1315,6 +1352,8 @@ class AssetEngine:
             out["spot_now"] = spot_now
         if spot_start is not None:
             out["spot_start"] = spot_start
+        if self._research_structural_fields:
+            out.update(self._research_structural_fields)
         forced = self._try_quota_override(out, yes_price, p_base, p_real)
         return forced if forced is not None else out
 
@@ -1471,13 +1510,30 @@ class AssetEngine:
                 "no_bid":       d.get("no_bid"),
                 "no_ask":       d.get("no_ask"),
                 "kalshi_spread": d.get("kalshi_spread"),
+                "quote_age_secs": d.get("quote_age_secs"),
+                "fresh_venue_count": d.get("fresh_venue_count"),
+                "raw_tte": d.get("raw_tte"),
+                "tau_used": d.get("tau_used"),
+                "realized_vol_value": d.get("realized_vol_value"),
+                "sigma_used": d.get("sigma_used"),
                 "signals":      self.signal.get_components(),
             }
+            action = str(rec.get("action") or "")
+            strategy = str(rec.get("strategy") or "")
+            rec["p_market_semantics"] = (
+                "raw_WAIT" if action == "WAIT" else
+                "raw_fill_quota" if action.startswith("BUY") and strategy == "fill_quota" else
+                "smoothed_buy_decision" if action.startswith("BUY") else "unknown"
+            )
             if self.research_store:
                 try:
                     self.research_store.observe(rec)
                 except Exception as e:
                     log.warning("Research observe hook failed: %s", e)
+                try:
+                    self.research_store.observe_boundary(rec)
+                except Exception as e:
+                    log.warning("Boundary research observe hook failed: %s", e)
             Path(DECISION_LOG).parent.mkdir(parents=True, exist_ok=True)
             rotate_log_if_needed(DECISION_LOG, DECISIONS_MAX_LINES, DECISIONS_KEEP_LINES)
             with open(DECISION_LOG, "a", encoding="utf-8") as f:
