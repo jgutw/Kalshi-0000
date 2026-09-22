@@ -17,6 +17,26 @@ GROUPS = {
     "microstructure_inputs": ["raw_features"],
 }
 FIELDS = sum(GROUPS.values(), [])
+NONFINITE_KINDS = ("positive_infinity", "negative_infinity", "nan")
+NUMERIC_FEATURES = set(FIELDS) - {"price_to_beat_source", "lead_source", "p_market_semantics", "per_venue_mids", "per_venue_staleness", "raw_features"}
+
+
+def represent_nonfinite(features, availability, expected):
+    """Represent declared scalar numbers after selection; never clean metadata.
+
+    Outcomes, unexpected source fields and nested objects remain subject to
+    strict serialization failure, rather than receiving inferred numeric types.
+    """
+    kinds = {}
+    for field in expected & NUMERIC_FEATURES:
+        value = features[field]
+        if isinstance(value, float) and not math.isfinite(value):
+            kinds[field] = "nan" if math.isnan(value) else "positive_infinity" if value > 0 else "negative_infinity"
+            features[field] = None
+            availability[field] = "nonfinite"
+    return kinds
+
+
 V1 = set("spot_now spot_start price_to_beat price_to_beat_source p_base p_real alpha_micro yes_price_raw p_market p_market_semantics lag_signal lag_confidence response_gap response_beta per_venue_mids per_venue_staleness time_remaining raw_features".split())
 V2 = set(FIELDS) - set("spot_start realized_vol spot_return_1s response_gap response_beta lag_signal lag_confidence kalshi_prob_change_1s time_remaining mispricing_base confidence_weighted_mispricing bias conviction belief_vol dist_from_threshold raw_features".split())
 # Fields defined by the decision logger, restricted to the research allowlist.
@@ -285,6 +305,9 @@ def build(manifest):
             features["raw_features"] = ({f: raw[f] for f in ("obi", "ofi_hawkes", "microprice_dev", "trade_sign_autocorr", "lag_signal", "response_gap") if f in raw} if isinstance(raw, dict) else None)
             availability = {f: "observed" if row.get(f) is not None else "missing" if f in expected else "structurally_unavailable" for f in FIELDS}
             target[k] = dict(provenance, source_population=population, selection_rule=rule, features=features, availability=availability, outcome=None)
+            nonfinite = represent_nonfinite(features, availability, expected)
+            if nonfinite:
+                target[k]["nonfinite_features"] = nonfinite
         fence["by_source"].append(source_count)
         counts["cohort_included_records"] = source_count["records_after"]
         counts["cohort_excluded_records"] = source_count["records_excluded"]
@@ -317,7 +340,7 @@ def build(manifest):
     # Eligibility anywhere in the supplied stream excludes a window, including
     # early warmup and post-entry position_open records surrounding that tick.
     return dict(populations, population_overlap=overlap, abstention_census=[census[k] for k in sorted(census.keys() - a.keys())],
-                schema_provenance={"builder_schema_version": 2, "cohort": cohort, "cohort_fence": fence, "malformed_record_handling": handling, "sources": sources, "taxonomy": GROUPS, "selection_rules": {"A_decision": RULE_A, "A_research_v1": RULE_V1, "B": RULE_B}, "defined_fields": {"decision": sorted(DECISION), "research_v1": sorted(V1), "research_v2": sorted(V2)}, "variable_semantics": VARIABLE_SEMANTICS, "semantics": SEMANTICS}, coverage_missingness=coverage)
+                schema_provenance={"builder_schema_version": 3, "cohort": cohort, "cohort_fence": fence, "malformed_record_handling": handling, "sources": sources, "taxonomy": GROUPS, "selection_rules": {"A_decision": RULE_A, "A_research_v1": RULE_V1, "B": RULE_B}, "defined_fields": {"decision": sorted(DECISION), "research_v1": sorted(V1), "research_v2": sorted(V2)}, "variable_semantics": VARIABLE_SEMANTICS, "semantics": SEMANTICS}, coverage_missingness=coverage)
 
 
 SEMANTICS = [

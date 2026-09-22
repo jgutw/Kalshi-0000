@@ -47,6 +47,60 @@ class MarketStateDatasetTests(unittest.TestCase):
     def encoded(self, row):
         return json.dumps(row, ensure_ascii=False).encode("utf-8")
 
+    def test_nonfinite_scalar_states_and_strict_round_trip(self):
+        result = self.run_build(("decision", [self.row(z_threshold=float('inf'), response_beta=float('-inf'),
+                                                     realized_vol_value=float('nan'), spot_now=12, kalshi_spread=None)]))
+        row = result['preferred_ge_60s'][0]
+        self.assertEqual(row['nonfinite_features'], dict(z_threshold='positive_infinity', response_beta='negative_infinity', realized_vol_value='nan'))
+        for field in row['nonfinite_features']:
+            self.assertIsNone(row['features'][field])
+            self.assertEqual(row['availability'][field], 'nonfinite')
+        self.assertEqual(row['features']['spot_now'], 12)
+        self.assertEqual(row['availability']['kalshi_spread'], 'missing')
+        self.assertEqual(row['availability']['raw_distance'], 'structurally_unavailable')
+        self.assertEqual(result['coverage_missingness']['preferred_ge_60s']['fields']['z_threshold'], {'nonfinite': 1})
+        self.assertEqual(json.loads((self.root / 'source0.jsonl').read_text())['z_threshold'], float('inf'))
+        write_artifacts(result, self.root / 'represented')
+        def reject(token):
+            raise AssertionError('non-standard numeric token: ' + token)
+        for path in (self.root / 'represented').iterdir():
+            content = path.read_text()
+            if path.suffix == '.jsonl':
+                for line in content.splitlines():
+                    json.loads(line, parse_constant=reject)
+            else:
+                json.loads(content, parse_constant=reject)
+
+    def test_nonfinite_representation_preserves_membership_and_outcomes(self):
+        for value in (2., float('inf'), float('-inf'), float('nan')):
+            result = self.run_build(("decision", [self.row(z_threshold=value), self.row(window_id_ts=200, p_real=None, reason='signal_warmup')]),
+                                    ("research_v2", [self.boundary(z_threshold=value), self.outcome()]))
+            self.assertEqual([(r['asset'], r['window_id_ts']) for r in result['preferred_ge_60s']], [('BTC', 100)])
+            self.assertEqual(len(result['boundary_60']), 1)
+            self.assertEqual(result['population_overlap'][0]['membership'], 'both')
+            self.assertEqual([r['window_id_ts'] for r in result['abstention_census']], [200])
+            self.assertEqual(result['boundary_60'][0]['outcome']['actual_outcome'], 'YES')
+
+    def test_nonfinite_v1_and_existing_eligibility_rules(self):
+        result = self.run_build(("research_v1", [self.outcome(schema_version=1, response_beta=float('nan'))]))
+        self.assertEqual(result['preferred_ge_60s'][0]['nonfinite_features'], {'response_beta': 'nan'})
+        result = self.run_build(("decision", [self.row(p_real=float('inf')), self.row(window_id_ts=200, time_remaining=float('inf'))]))
+        self.assertEqual(result['preferred_ge_60s'], [])
+        with self.assertRaisesRegex(ValueError, 'ineligible'):
+            self.run_build(("research_v1", [self.outcome(schema_version=1, p_real=float('inf'))]))
+
+    def test_nonfinite_outside_declared_scalar_features_still_fails(self):
+        cases = [self.row(raw_distance=float('inf')), self.row(raw_features={'obi': float('nan')}),
+                 self.row(lead_source=float('inf')), self.row(decision_id=float('inf'))]
+        for i, row in enumerate(cases):
+            with self.subTest(i=i):
+                result = self.run_build(("decision", [row]))
+                with self.assertRaises(ValueError):
+                    write_artifacts(result, self.root / ('invalid_' + str(i)))
+        result = self.run_build(("research_v2", [self.boundary(), self.outcome(exit_spot=float('inf'))]))
+        with self.assertRaises(ValueError):
+            write_artifacts(result, self.root / 'invalid_outcome')
+
     def test_malformed_default_and_explicit_fail_are_strict(self):
         for settings in ({}, {"malformed_record_policy": "fail"}, self.fence()):
             with self.subTest(settings=settings):
@@ -400,7 +454,7 @@ class MarketStateDatasetTests(unittest.TestCase):
         result = self.run_build(("decision", [self.row(ts="z", time_remaining=60), self.row(time_remaining=59), self.row(ts="a", time_remaining=62)]))
         self.assertEqual(result["preferred_ge_60s"][0]["observation_timestamp"], "a")
         self.assertEqual(result["preferred_ge_60s"][0]["selection_rule"], RULE_A)
-        self.assertEqual(result["schema_provenance"]["builder_schema_version"], 2)
+        self.assertEqual(result["schema_provenance"]["builder_schema_version"], 3)
         self.assertEqual(result["schema_provenance"]["selection_rules"], {"A_decision": RULE_A, "A_research_v1": RULE_V1, "B": RULE_B})
         fence = result["schema_provenance"]["cohort_fence"]
         self.assertFalse(fence["applied"])

@@ -100,9 +100,61 @@ The cohort clock follows the source contract:
 `schema_provenance.cohort_fence` records the requested bound strings, whether
 the fence was applied, the half-open interval, and record counts before,
 after, and excluded, including the same counts per source file. Counts are
-cohort-filter counts, not population sizes. `builder_schema_version` stays 2
-because selection and availability semantics are unchanged.
+cohort-filter counts, not population sizes. The P7B-H fence retained schema 2;
+P7B-NFR below advances the availability contract to schema 3.
 `schema_provenance.sources` remains path, type, and hash only.
+
+## Feature-level nonfinite representation (P7B-NFR, schema 3)
+
+New builds use `builder_schema_version=3`. Population rules and the six output
+filenames are unchanged. For declared top-level scalar numeric features only:
+
+```json
+{
+  "features": {"z_threshold": null},
+  "availability": {"z_threshold": "nonfinite"},
+  "nonfinite_features": {"z_threshold": "positive_infinity"}
+}
+```
+
+This excerpt omits other required row fields. Exact kinds are
+`positive_infinity`, `negative_infinity`, and `nan`. The companion map is omitted
+when empty. Its keys must match exactly the features with `nonfinite`
+availability. Row source path, whole-file hash, original line and observation
+identity remain unchanged: they identify the persisted source value. Null is
+only its strict-JSON numeric representation, not missingness or an imputation.
+
+Finite values, ordinary null/missing values and structural absence retain their
+existing behavior. Normalization runs after existing eligibility/selection
+checks; it neither makes an ineligible row eligible nor discards an eligible
+row. In particular, nonfinite `p_real` or `time_remaining` still cannot qualify
+an A observation. A/B membership, overlap, census and outcome joins are unchanged.
+
+The scope is the source contract's declared scalar numeric feature fields,
+not arbitrary data cleaning. Nested objects, categorical fields, fields outside
+the declared source contract, provenance and outcomes are not normalized;
+nonfinite values there still fail strict serialization. No source values are
+clamped, recalculated or rewritten. `allow_nan=False` remains in force.
+
+Coverage counts `nonfinite` separately. P7C-A accepts clean schema-2 artifacts
+and schema-3 artifacts and validates sign/state/null consistency. Older analyzers
+that only accept schema 2 must be upgraded before reading schema 3.
+
+Future shadow-readiness item (not implemented here): production/research writers
+need a separately reviewed standards-compliant nonfinite-state contract. Current
+model calculations and permissive runtime writers are untouched by P7B-NFR.
+
+P7B-NFR synthetic validation: 43 P7B tests and 36 P7C-A tests passed (79
+combined), including nine new tests for representation, eligibility invariance,
+strict round-tripping, analyzer coverage/pair denominators, schema compatibility
+and invalid-state rejection. The guarded harness documented below used
+`loadTestsFromNames` for these two modules, with dotenv disabled and network
+connection/DNS calls blocked. Related synthetic checks passed: research store
+20/20, boundary store 17/17, forecast history 15/15. The initial run found one
+old assertion expecting builder schema 2; it was updated to the intentional
+schema-3 contract before the successful full run. No engine suite, actual-data
+Stage 2 build or actual-data P7C-A run was performed. Changes remain uncommitted
+for independent review.
 
 ## Optional historical malformed-record quarantine (P7B-HQ)
 
@@ -146,8 +198,8 @@ A later fatal error returns no successful build or partial quarantine artifact.
 
 `schema_provenance.malformed_record_handling` contains `policy`, `ledger`,
 aggregate `accounting`, `by_source` accounting, and explicit reconciliation
-results. The existing six output filenames and population schema version 2 are
-retained; metadata is additive. Ledger fields are:
+results. Quarantine retains the six output filenames; its metadata is additive.
+The later NFR availability extension uses schema 3. Ledger fields are:
 
 - source_file, source_type and source_sha256 (hash of the complete source bytes);
 - source_line (one-based original physical line) and byte_offset (zero-based);
@@ -251,9 +303,10 @@ inferred solely from manifest labels. Outcome availability never selects feature
 Null or absent fields defined by the source contract are `missing`. Null or
 absent fields outside that contract are `structurally_unavailable`, even when
 an export includes a null placeholder. Non-null explicitly persisted allowlisted
-values are preserved as observed, including extensions outside the base contract.
+values are preserved as observed, including extensions outside the base contract,
+except declared scalar nonfinite values represented explicitly by NFR above.
 The schema summary exports `defined_fields` for decision, research_v1 and
-research_v2; builder_schema_version is now 2 to identify the corrected semantics.
+research_v2; builder_schema_version is now 3 for the NFR extension.
 Decision availability uses the known logger contract, not the union of all
 research columns: target_tte, actual_tte, raw_distance, relative_distance,
 log_distance and legacy realized_vol are not defined there. raw_tte, tau_used,
@@ -292,8 +345,9 @@ the supplied observations.
 
 Malformed JSON fails by default; only the explicit historical policy above
 permits its quarantine. Invalid keys, schema conflicts and duplicate sidecars
-still fail the build. Features must be JSON-serializable finite values for artifact writing;
-nonfinite retained feature values cause an explicit serialization error. Inputs
+still fail the build. Numeric artifact values must be finite; declared scalar
+nonfinite source features use NFR's null-plus-state representation. Any remaining
+nonfinite value causes an explicit serialization error. Inputs
 must be static and fit in memory. Writes are not a multi-file transaction; a
 serialization/I/O failure can leave a partial new output directory, which must
 not be treated as a completed build. Unknown future schema fields are not

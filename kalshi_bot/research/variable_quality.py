@@ -13,6 +13,7 @@ from itertools import combinations
 
 from .market_state_dataset import (
     DECISION, FIELDS, GROUPS, RULE_A, RULE_B, RULE_V1, V1, V2, finite, safe_path,
+    NONFINITE_KINDS, NUMERIC_FEATURES,
 )
 
 BASELINE = '5116cdec49e47ddca65c34f1105d62678c4a9f38'
@@ -20,7 +21,7 @@ POPULATIONS = ('preferred_ge_60s', 'boundary_60')
 CATEGORICAL = {'price_to_beat_source', 'lead_source', 'p_market_semantics'}
 MAPS = {'per_venue_mids', 'per_venue_staleness', 'raw_features'}
 RAW_KEYS = ('obi', 'ofi_hawkes', 'microprice_dev', 'trade_sign_autocorr', 'lag_signal', 'response_gap')
-STATES = ('observed', 'missing', 'structurally_unavailable')
+STATES = ('observed', 'nonfinite', 'missing', 'structurally_unavailable')
 CATEGORY = {field: category for category, fields in GROUPS.items() for field in fields}
 NUMERIC_FIELDS = tuple(field for field in FIELDS if field not in MAPS | CATEGORICAL)
 DEFINED = {'decision': DECISION, 'research_v1': V1, 'research_v2': V2}
@@ -59,14 +60,19 @@ def summarize(entries, kind='numeric'):
     """entries are (availability, value); every count states its denominator."""
     n = len(entries)
     states = Counter(state for state, _ in entries)
+    nonfinite_kinds = {name: states[name] for name in NONFINITE_KINDS}
+    states['nonfinite'] += sum(nonfinite_kinds.values())
     counts = {state: states[state] for state in (*STATES, 'invalid_parent')}
     observed = [value for state, value in entries if state == 'observed']
     defined = n - counts['structurally_unavailable']
-    result = dict(rows=n, nonstructural_rows=defined, availability=counts, observed_fraction_all_rows=len(observed) / n if n else None,
-                  observed_fraction_nonstructural_rows=len(observed) / defined if defined else None)
+    observed_n = len(observed) + counts['nonfinite']
+    result = dict(rows=n, nonstructural_rows=defined, availability=counts, observed_fraction_all_rows=observed_n / n if n else None,
+                  observed_fraction_nonstructural_rows=observed_n / defined if defined else None,
+                  nonfinite_observed=counts['nonfinite'], nonfinite_kinds=nonfinite_kinds)
     valid = [v for v in observed if numeric(v)] if kind == 'numeric' else [v for v in observed if isinstance(v, str)] if kind == 'categorical' else [v for v in observed if isinstance(v, dict)]
     result.update(valid_values=len(valid), invalid_observed_values=len(observed) - len(valid), value_kind=kind)
     if kind == 'numeric':
+        result['finite_observed'] = len(valid)
         masses = Counter(valid)
         top = sorted(masses.items(), key=lambda pair: (-pair[1], pair[0]))[:5]
         result.update(quantiles=quantiles(valid), unique_values=len(masses), zero_count=masses[0],
@@ -123,8 +129,22 @@ def validate_row(row, population, metadata, seen, observation_ids):
     features, availability = row.get('features'), row.get('availability')
     if not isinstance(features, dict) or not isinstance(availability, dict) or set(features) != set(FIELDS) or set(availability) != set(FIELDS):
         raise ValueError('unexpected feature/availability schema')
+    # Accepted artifacts cannot smuggle permissive JSON constants around the
+    # explicit signed-state contract, including inside nested features.
+    json.dumps(features, allow_nan=False)
+    nonfinite = row.get('nonfinite_features', {})
+    if not isinstance(nonfinite, dict) or set(nonfinite) - (DEFINED[kind] & NUMERIC_FEATURES):
+        raise ValueError('unexpected nonfinite feature metadata')
+    if (nonfinite or 'nonfinite' in availability.values()) and metadata['builder_schema_version'] != 3:
+        raise ValueError('nonfinite state requires P7B schema 3')
+    if set(nonfinite) != {f for f in FIELDS if availability[f] == 'nonfinite'}:
+        raise ValueError('nonfinite state/kind mismatch')
     for field in FIELDS:
         state, value = availability[field], features[field]
+        if state == 'nonfinite':
+            if value is not None or nonfinite[field] not in NONFINITE_KINDS:
+                raise ValueError('invalid nonfinite representation')
+            continue
         if state not in STATES or (state == 'observed') != (value is not None):
             raise ValueError('inconsistent availability/value')
         if state != 'observed' and state != ('missing' if field in DEFINED[kind] else 'structurally_unavailable'):
@@ -138,6 +158,14 @@ def validate_row(row, population, metadata, seen, observation_ids):
             raise ValueError('ineligible Population A row')
     elif finite(features['target_tte']) != 60:
         raise ValueError('boundary population requires target_tte 60')
+
+
+def feature_entry(row, field):
+    """Carry the signed nonfinite state into summaries, never as a number."""
+    state = row['availability'][field]
+    if state == 'nonfinite':
+        state = row['nonfinite_features'][field]
+    return state, row['features'][field]
 
 
 def nested_entries(rows, parent, child):
@@ -162,7 +190,7 @@ def paired_quality(rows):
     quotes = ('yes_bid', 'yes_ask', 'no_bid', 'no_ask')
     # Nulls outside the source contract are structural absence, not missing quotes.
     quote_rows = [r for r in rows if all(q in DEFINED[r['source_type']] for q in quotes)]
-    all_null_quote_rows = [r for r in quote_rows if all(r['features'][q] is None for q in quotes)]
+    all_null_quote_rows = [r for r in quote_rows if all(r['features'][q] is None and r['availability'][q] == 'missing' for q in quotes)]
     return dict(
         dislocation_with_valid_venue_count=len(valid),
         zero_dislocation_with_valid_venue_count=len(zero),
@@ -184,7 +212,7 @@ def analyze(populations, metadata, *, quote_stale_seconds=None, venue_stale_seco
         raise ValueError('explicit P7B cohort required')
     if cohort['session_tag'] == 'p6c_d1_validation':
         raise ValueError('P6C-E excluded')
-    if metadata.get('builder_schema_version') != 2 or metadata.get('taxonomy') != GROUPS or metadata.get('selection_rules') != {'A_decision': RULE_A, 'A_research_v1': RULE_V1, 'B': RULE_B} or metadata.get('defined_fields') != {k: sorted(v) for k, v in DEFINED.items()}:
+    if metadata.get('builder_schema_version') not in (2, 3) or metadata.get('taxonomy') != GROUPS or metadata.get('selection_rules') != {'A_decision': RULE_A, 'A_research_v1': RULE_V1, 'B': RULE_B} or metadata.get('defined_fields') != {k: sorted(v) for k, v in DEFINED.items()}:
         raise ValueError('requires accepted P7B schema from 5116cde')
     if not isinstance(metadata.get('sources'), list) or any(not isinstance(s, dict) for s in metadata['sources']):
         raise ValueError('source provenance required')
@@ -204,7 +232,7 @@ def analyze(populations, metadata, *, quote_stale_seconds=None, venue_stale_seco
         rows = groups[group]
         variables = []
         for field in FIELDS:
-            entries = [(r['availability'][field], r['features'][field]) for r in rows]
+            entries = [feature_entry(r, field) for r in rows]
             kind = 'object' if field in MAPS else 'categorical' if field in CATEGORICAL else 'numeric'
             variable = dict(field=field, category=CATEGORY[field], **summarize(entries, kind))
             if field in ('realized_vol', 'realized_vol_value'):
@@ -230,7 +258,7 @@ def analyze(populations, metadata, *, quote_stale_seconds=None, venue_stale_seco
                             persisted_mode_evidence_missing=sum(r.get('persisted_mode') is None and r.get('persisted_dry_run') is None for r in rows),
                             variables=variables, measurement_context=paired_quality(rows),
                             redundancy=redundancy(rows), temporal=temporal_diagnostics(rows)))
-    return dict(analyzer_schema_version=1, research_tooling_baseline=BASELINE, cohort=cohort,
+    return dict(analyzer_schema_version=2, research_tooling_baseline=BASELINE, cohort=cohort,
                 population_rows={p: len(populations[p]) for p in POPULATIONS},
                 settings=dict(quote_stale_seconds=quote_stale_seconds, venue_stale_seconds=venue_stale_seconds),
                 methodology=NOTES, groups=reports, asset_stability=asset_diagnostics(groups))
@@ -361,7 +389,7 @@ def temporal_diagnostics(rows):
     days, timestamps = time_buckets(rows)
     ordered = sorted(days)
     daily = [dict(utc_date=day, rows=len(days[day]), variables=[
-        dict(field=f, **summarize([(r['availability'][f], r['features'][f]) for r in days[day]]))
+        dict(field=f, **summarize([feature_entry(r, f) for r in days[day]]))
         for f in NUMERIC_FIELDS]) for day in ordered]
     comparisons = [dict(left_utc_date=left, right_utc_date=right,
                         calendar_gap_days=(datetime.fromisoformat(right) - datetime.fromisoformat(left)).days,
@@ -390,6 +418,7 @@ def asset_diagnostics(groups):
 
 
 NOTES = [
+    'P7B schema 3: declared scalar nonfinite features use null plus nonfinite availability and signed nonfinite_features metadata. Schema 2 remains readable. Nonfinite observations count toward observed coverage but never finite-value statistics; invalid_observed_values excludes the separately reported nonfinite states.',
     'P7C-A diagnostics only: no candidate/conditional ranking, performance, outcome statistics, regimes or stable/unstable verdicts.',
     'Groups keep population, source type, source schema, asset and recorded runtime revision separate. No feature joins or synchronized cross-asset observations.',
     'Coverage denominators: all group rows and nonstructural group rows. Observed does not mean numerically valid. Strict numbers exclude booleans, strings and nonfinite values.',
@@ -417,7 +446,9 @@ def load_and_analyze(input_dir, **settings):
         data = path.read_bytes()
         inputs.append(dict(path=str(path), sha256=hashlib.sha256(data).hexdigest(), bytes=len(data)))
         text = data.decode('utf-8-sig')
-        return [json.loads(line) for line in text.splitlines() if line.strip()] if jsonl else json.loads(text)
+        def reject_constant(token):
+            raise ValueError('non-standard JSON numeric token in P7B artifact: ' + token)
+        return [json.loads(line, parse_constant=reject_constant) for line in text.splitlines() if line.strip()] if jsonl else json.loads(text, parse_constant=reject_constant)
 
     metadata = read('schema_provenance.json')
     if not isinstance(metadata, dict) or not isinstance(metadata.get('cohort'), dict):

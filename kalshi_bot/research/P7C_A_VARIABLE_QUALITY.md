@@ -58,7 +58,7 @@ of observations is not a claim about coverage in an underlying population.
 
 ## Exact coverage and distribution metrics
 
-Coverage retains P7B `observed`, `missing`, and `structurally_unavailable` states
+Coverage retains P7B `observed`, `nonfinite`, `missing`, and `structurally_unavailable` states
 and checks them against the accepted source contract. Counts and two fractions
 are supplied: observed/all group rows and observed/nonstructural group rows.
 The nonstructural denominator is explicit; a zero denominator yields null.
@@ -257,3 +257,33 @@ local credentials. The network guard covers the test process; CLI subprocesses
 import offline modules only. Approved unsandboxed execution is used where
 Windows sandbox temporary-directory ACLs prevent fixtures from working.
 No real historical or prospective artifact cohort is supplied in this pass.
+## P7B-NFR compatibility: explicit nonfinite states
+
+The analyzer now accepts P7B schema 2 and schema 3, and emits analyzer schema 2.
+Schema 3 uses a null scalar numeric slot, `availability[field] = nonfinite`, and
+`nonfinite_features[field]` equal to `positive_infinity`, `negative_infinity` or
+`nan`. Missing/extra/unknown kind entries, non-null represented slots, fields
+outside the declared scalar numeric contract and nonfinite states in schema 2
+are rejected. Literal non-standard JSON Infinity/NaN tokens are rejected on load.
+
+Population N includes these observations. Each variable reports availability
+counts for observed, nonfinite, missing and structurally unavailable, plus
+nonfinite_observed and counts for each signed kind. For numeric variables,
+finite_observed equals valid_values. Observed coverage fractions include both
+ordinary observed and explicit nonfinite observations; the separate
+invalid_observed_values metric retains its existing type-quality meaning and
+does not include the separately counted nonfinite states. Consequently:
+
+`rows = finite_observed + invalid_observed_values + nonfinite_observed + missing + structurally_unavailable`
+
+For nested summaries add invalid_parent to that identity. Quantiles, masses,
+Pearson/Spearman pair counts and distribution comparisons use finite numeric
+values only. Temporal summaries preserve signed nonfinite counts. A nulled
+nonfinite quote is not counted as an ordinary missing quote/book. No statistical
+thresholds, performance calculations or population-selection rules were added.
+
+Clean schema-2 and schema-3 data have the same diagnostic values; new zero-count
+fields and the analyzer version are output-contract additions. Nested object
+nonfinite values remain unsupported/fail-closed in P7B; no nested measurement
+policy is inferred by this extension. No actual-data analyzer run is authorized
+by this implementation.

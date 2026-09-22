@@ -44,12 +44,77 @@ class VariableQualityTests(unittest.TestCase):
         data = self.dataset([self.decision(kalshi_spread=None), self.decision(101, kalshi_spread=.02)])
         result = self.run_analysis(data)
         spread = self.variable(result, 'kalshi_spread')
-        self.assertEqual(spread['availability'], dict(observed=1, missing=1, structurally_unavailable=0, invalid_parent=0))
+        self.assertEqual(spread['availability'], dict(observed=1, nonfinite=0, missing=1, structurally_unavailable=0, invalid_parent=0))
         self.assertEqual(spread['observed_fraction_all_rows'], .5)
         target = self.variable(result, 'target_tte')
         self.assertEqual(target['availability']['structurally_unavailable'], 2)
         self.assertIsNone(target['observed_fraction_nonstructural_rows'])
         self.assertIsNone(target['quantiles'])
+
+    def test_nonfinite_counts_quantiles_pairs_and_loading(self):
+        values = [(1, 2), (3, 6), (float('inf'), 8), (float('-inf'), 10), (float('nan'), 12), (9, float('inf')), (None, 14)]
+        data = self.dataset([self.decision(100+i, z_threshold=x, response_beta=y) for i, (x, y) in enumerate(values)])
+        root = self.root / 'represented'
+        write_artifacts(data, root)
+        report = load_and_analyze(root)
+        v = self.variable(report, 'z_threshold')
+        self.assertEqual(v['rows'], 7)
+        self.assertEqual(v['availability'], dict(observed=3, nonfinite=3, missing=1, structurally_unavailable=0, invalid_parent=0))
+        self.assertEqual(v['nonfinite_kinds'], dict(positive_infinity=1, negative_infinity=1, nan=1))
+        self.assertEqual(v['finite_observed'], 3)
+        self.assertEqual(v['observed_fraction_all_rows'], 6/7)
+        self.assertEqual(v['quantiles']['p50'], 3)
+        pair = next(p for p in report['groups'][0]['redundancy'] if {p['left'], p['right']} == {'z_threshold', 'response_beta'})
+        self.assertEqual(pair['paired_valid_rows'], 2)
+        self.assertAlmostEqual(pair['pearson'], 1)
+        self.assertAlmostEqual(pair['spearman'], 1)
+        daily = report['groups'][0]['temporal']['daily'][0]['variables']
+        self.assertEqual(next(v for v in daily if v['field'] == 'z_threshold')['nonfinite_observed'], 3)
+        loaded = [json.loads(line) for line in (root / 'preferred_ge_60s.jsonl').read_text().splitlines()]
+        self.assertEqual(loaded[2]['nonfinite_features'], data['preferred_ge_60s'][2]['nonfinite_features'])
+        self.assertEqual(loaded[2]['source_sha256'], data['preferred_ge_60s'][2]['source_sha256'])
+        json.dumps(report, allow_nan=False)
+
+    def test_nonfinite_metadata_inconsistencies_fail_closed(self):
+        original = self.dataset([self.decision(z_threshold=float('inf'))])
+        mutations = [
+            lambda d: d['preferred_ge_60s'][0].pop('nonfinite_features'),
+            lambda d: d['preferred_ge_60s'][0]['nonfinite_features'].update(z_threshold='unknown'),
+            lambda d: d['preferred_ge_60s'][0]['features'].update(z_threshold=4),
+            lambda d: d['preferred_ge_60s'][0]['availability'].update(z_threshold='missing'),
+            lambda d: d['schema_provenance'].update(builder_schema_version=2),
+            lambda d: d['preferred_ge_60s'][0]['nonfinite_features'].update(raw_distance='nan'),
+        ]
+        for i, mutate in enumerate(mutations):
+            data = copy.deepcopy(original); mutate(data)
+            with self.subTest(i=i), self.assertRaises(ValueError):
+                self.run_analysis(data)
+
+    def test_clean_schema_two_and_three_analysis_agree(self):
+        data = self.dataset([self.decision(z_threshold=1), self.decision(101, z_threshold=2)])
+        current = self.run_analysis(data)
+        self.assertNotIn('nonfinite_features', data['preferred_ge_60s'][0])
+        data['schema_provenance']['builder_schema_version'] = 2
+        self.assertEqual(current, self.run_analysis(data))
+
+    def test_nonfinite_quote_is_not_missing_book(self):
+        data = self.dataset([self.decision(yes_bid=float('inf'))])
+        context = self.run_analysis(data)['groups'][0]['measurement_context']
+        self.assertEqual(context['rows_with_all_four_quotes_null'], 0)
+
+    def test_literal_nonfinite_artifact_and_unrepresented_values_rejected(self):
+        data = self.dataset([self.decision(z_threshold=2)])
+        root = self.root / 'invalid_literals'
+        write_artifacts(data, root)
+        path = root / 'preferred_ge_60s.jsonl'
+        row = json.loads(path.read_text())
+        row['features']['z_threshold'] = float('inf')
+        path.write_text(json.dumps(row) + '\n')
+        with self.assertRaisesRegex(ValueError, 'non-standard JSON'):
+            load_and_analyze(root)
+        data['preferred_ge_60s'][0]['features']['z_threshold'] = float('inf')
+        with self.assertRaises(ValueError):
+            self.run_analysis(data)
 
     def test_known_quantiles_and_exact_masses(self):
         summary = summarize([('observed', v) for v in (0, 0, 2, 6)])
@@ -221,7 +286,7 @@ class VariableQualityTests(unittest.TestCase):
     def test_nested_venue_denominators_and_invalid_parent(self):
         data = self.dataset([self.decision(per_venue_mids={'venue': 100}), self.decision(101, per_venue_mids={}), self.decision(102), self.decision(103, per_venue_mids='bad')])
         nested = self.variable(self.run_analysis(data), 'per_venue_mids', 'venue')
-        self.assertEqual(nested['availability'], dict(observed=1, missing=2, structurally_unavailable=0, invalid_parent=1))
+        self.assertEqual(nested['availability'], dict(observed=1, nonfinite=0, missing=2, structurally_unavailable=0, invalid_parent=1))
         self.assertEqual(nested['observed_fraction_all_rows'], .25)
 
     def test_nested_estimates_and_categorical_values(self):
