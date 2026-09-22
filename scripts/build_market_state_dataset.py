@@ -14,11 +14,17 @@ def main():
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--start-utc", default=None, help="inclusive cohort bound, timezone-aware ISO-8601; requires --end-utc")
     parser.add_argument("--end-utc", default=None, help="exclusive cohort bound, timezone-aware ISO-8601; requires --start-utc")
+    parser.add_argument("--malformed-record-policy", choices=("fail", "quarantine"), default=None,
+                        help="default fail; quarantine is explicit historical/development paper reconstruction only")
     args = parser.parse_args()
     manifest_path = safe_path(args.manifest)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
     for source in manifest["sources"]:
         source["path"] = str(manifest_path.parent / source["path"])
+    if args.malformed_record_policy is not None:
+        if "malformed_record_policy" in manifest and manifest["malformed_record_policy"] != args.malformed_record_policy:
+            raise SystemExit("malformed-record policy conflicts with manifest")
+        manifest["malformed_record_policy"] = args.malformed_record_policy
     if (args.start_utc is None) != (args.end_utc is None):
         raise SystemExit("cohort fence requires both --start-utc and --end-utc")
     if args.start_utc is not None:

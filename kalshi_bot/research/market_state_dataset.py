@@ -117,6 +117,34 @@ def safe_path(path):
     return path
 
 
+def _physical_lines(content):
+    """Retain raw UTF-8 bytes and physical CR/LF/CRLF numbering for provenance."""
+    # Encoding damage is not a JSON decoding error and must still fail closed.
+    content.decode("utf-8-sig")
+    offset = 0
+    for number, raw in enumerate(content.splitlines(keepends=True), 1):
+        body = raw[:-2] if raw.endswith(b"\r\n") else raw[:-1] if raw.endswith((b"\r", b"\n")) else raw
+        line = body.decode("utf-8-sig" if number == 1 else "utf-8")
+        # The old str.splitlines reader also split Unicode/control separators.
+        # Do not silently reinterpret such input or report false physical lines.
+        if line.strip() and len(line.splitlines()) != 1:
+            raise ValueError(f"unsupported nonphysical line separator on source line {number}")
+        yield number, offset, raw, line
+        offset += len(raw)
+
+
+def _record_counts():
+    return dict(physical_lines=0, blank_lines=0, candidate_records=0,
+                parsed_records=0, quarantined_records=0,
+                cohort_included_records=0, cohort_excluded_records=0)
+
+
+def _reconciles(counts):
+    return (counts["physical_lines"] == counts["blank_lines"] + counts["candidate_records"]
+            and counts["candidate_records"] == counts["parsed_records"] + counts["quarantined_records"]
+            and counts["parsed_records"] == counts["cohort_included_records"] + counts["cohort_excluded_records"])
+
+
 def build(manifest):
     """Build one explicitly declared mode/session/sample cohort; fail closed on conflicts."""
     cohort = {f: manifest[f] for f in ("mode", "session_tag", "sample_kind")}
@@ -124,8 +152,14 @@ def build(manifest):
         raise ValueError("explicit valid cohort required")
     if cohort["session_tag"] == "p6c_d1_validation":
         raise ValueError("P6C-E is excluded")
+    policy = manifest.get("malformed_record_policy", "fail")
+    if policy not in ("fail", "quarantine"):
+        raise ValueError("malformed_record_policy must be fail or quarantine")
+    if policy == "quarantine" and (cohort["mode"] != "paper" or cohort["sample_kind"] not in {"development", "historical"}):
+        raise ValueError("quarantine is restricted to historical/development paper reconstruction inputs")
     bounds = cohort_bounds(manifest)
     a, b, census, outcomes, sources = {}, {}, {}, {}, []
+    handling = {"policy": policy, "accounting": _record_counts(), "by_source": [], "ledger": []}
     fence = {"applied": bounds is not None, "start_utc": None if bounds is None else bounds[0], "end_utc": None if bounds is None else bounds[1],
              "interval": None if bounds is None else "start <= cohort_time < end", "records_before": 0, "records_after": 0, "records_excluded": 0,
              "by_source": [], "clocks": COHORT_CLOCKS}
@@ -140,6 +174,8 @@ def build(manifest):
                 raise ValueError("choose decision OR research_v1 for Population A")
             a_type = kind
         path = safe_path(spec["path"])
+        if policy == "quarantine" and "research_data" in {part.lower() for part in path.parts}:
+            raise ValueError("quarantine requires offline reconstruction exports outside research_data")
         if path in seen_paths:
             raise ValueError("duplicate source path")
         seen_paths.add(path)
@@ -147,10 +183,32 @@ def build(manifest):
         digest = hashlib.sha256(content).hexdigest()
         sources.append({"path": str(path), "type": kind, "sha256": digest})
         source_count = {"path": str(path), "type": kind, "sha256": digest, "records_before": 0, "records_after": 0, "records_excluded": 0}
-        for line_no, line in enumerate(content.decode("utf-8-sig").splitlines(), 1):
+        counts = _record_counts()
+        for line_no, byte_offset, raw_line, line in _physical_lines(content):
+            counts["physical_lines"] += 1
             if not line.strip():
+                counts["blank_lines"] += 1
                 continue
-            row = json.loads(line)
+            counts["candidate_records"] += 1
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                if policy == "fail":
+                    raise
+                counts["quarantined_records"] += 1
+                handling["ledger"].append(dict(
+                    source_file=str(path), source_type=kind, source_sha256=digest,
+                    source_line=line_no, byte_offset=byte_offset,
+                    line_length_chars=len(line), raw_line_length_bytes=len(raw_line),
+                    raw_line_sha256=hashlib.sha256(raw_line).hexdigest(),
+                    parse_error_class=type(exc).__name__, parse_error_message=exc.msg,
+                    parse_error_column=exc.colno, parse_error_position=exc.pos,
+                    quarantine_reason="malformed_unclassifiable",
+                ))
+                continue
+            counts["parsed_records"] += 1
+            if not isinstance(row, dict):
+                raise ValueError(f"parsed record must be a JSON object: {path}:{line_no}")
             source_count["records_before"] += 1
             fence["records_before"] += 1
             if bounds is not None:
@@ -228,6 +286,16 @@ def build(manifest):
             availability = {f: "observed" if row.get(f) is not None else "missing" if f in expected else "structurally_unavailable" for f in FIELDS}
             target[k] = dict(provenance, source_population=population, selection_rule=rule, features=features, availability=availability, outcome=None)
         fence["by_source"].append(source_count)
+        counts["cohort_included_records"] = source_count["records_after"]
+        counts["cohort_excluded_records"] = source_count["records_excluded"]
+        if not _reconciles(counts):
+            raise ValueError("source record accounting does not reconcile")
+        handling["by_source"].append(dict(path=str(path), type=kind, sha256=digest, **counts, reconciles=True))
+        for field, value in counts.items():
+            handling["accounting"][field] += value
+    if not _reconciles(handling["accounting"]):
+        raise ValueError("build record accounting does not reconcile")
+    handling["reconciles"] = True
     for population in (a, b):
         for k, row in population.items():
             # No feature joins. A decision can use a v2 outcome only with
@@ -249,7 +317,7 @@ def build(manifest):
     # Eligibility anywhere in the supplied stream excludes a window, including
     # early warmup and post-entry position_open records surrounding that tick.
     return dict(populations, population_overlap=overlap, abstention_census=[census[k] for k in sorted(census.keys() - a.keys())],
-                schema_provenance={"builder_schema_version": 2, "cohort": cohort, "cohort_fence": fence, "sources": sources, "taxonomy": GROUPS, "selection_rules": {"A_decision": RULE_A, "A_research_v1": RULE_V1, "B": RULE_B}, "defined_fields": {"decision": sorted(DECISION), "research_v1": sorted(V1), "research_v2": sorted(V2)}, "variable_semantics": VARIABLE_SEMANTICS, "semantics": SEMANTICS}, coverage_missingness=coverage)
+                schema_provenance={"builder_schema_version": 2, "cohort": cohort, "cohort_fence": fence, "malformed_record_handling": handling, "sources": sources, "taxonomy": GROUPS, "selection_rules": {"A_decision": RULE_A, "A_research_v1": RULE_V1, "B": RULE_B}, "defined_fields": {"decision": sorted(DECISION), "research_v1": sorted(V1), "research_v2": sorted(V2)}, "variable_semantics": VARIABLE_SEMANTICS, "semantics": SEMANTICS}, coverage_missingness=coverage)
 
 
 SEMANTICS = [

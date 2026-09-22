@@ -1,4 +1,5 @@
 """Synthetic-only invariants for the offline P7B builder."""
+import copy
 import hashlib
 import json
 import subprocess
@@ -33,6 +34,170 @@ class MarketStateDatasetTests(unittest.TestCase):
 
     def outcome(self, **values):
         return self.row(**dict(dict(schema_version=2, record_kind="window_outcome", actual_outcome="YES", yes_settled=1, outcome_source="spot_vs_price_to_beat", exit_spot=999), **values))
+
+    def byte_sources(self, *sources, **settings):
+        manifest = dict(mode="paper", session_tag="fixture", sample_kind="historical", sources=[])
+        manifest.update(settings)
+        for i, (kind, content) in enumerate(sources):
+            path = self.root / f"bytes{i}.jsonl"
+            path.write_bytes(content)
+            manifest["sources"].append(dict(type=kind, path=str(path)))
+        return manifest
+
+    def encoded(self, row):
+        return json.dumps(row, ensure_ascii=False).encode("utf-8")
+
+    def test_malformed_default_and_explicit_fail_are_strict(self):
+        for settings in ({}, {"malformed_record_policy": "fail"}, self.fence()):
+            with self.subTest(settings=settings):
+                manifest = self.byte_sources(("decision", b'{"broken":\n'), **settings)
+                with self.assertRaises(json.JSONDecodeError):
+                    build(manifest)
+
+    def test_quarantine_order_physical_lines_and_raw_identity(self):
+        first = self.encoded(self.row(ts="z", p_real=.2))
+        last = self.encoded(self.row(ts="a", p_real=.7))
+        bad = '{"broken":"\u00e9'.encode("utf-8") + b"\r\n"
+        content = b"\xef\xbb\xbf" + first + b"\r\n \t\r\n" + bad + last
+        manifest = self.byte_sources(("decision", content), malformed_record_policy="quarantine")
+        result = build(manifest)
+        row = result["preferred_ge_60s"][0]
+        self.assertEqual((row["observation_timestamp"], row["source_line"]), ("a", 4))
+        self.assertEqual(row["features"]["p_real"], .7)
+        whole_hash = hashlib.sha256(content).hexdigest()
+        self.assertEqual(row["source_sha256"], whole_hash)
+        handling = result["schema_provenance"]["malformed_record_handling"]
+        self.assertEqual(handling["accounting"], dict(physical_lines=4, blank_lines=1, candidate_records=3,
+                         parsed_records=2, quarantined_records=1, cohort_included_records=2, cohort_excluded_records=0))
+        entry = handling["ledger"][0]
+        self.assertEqual(entry["source_line"], 3)
+        self.assertEqual(entry["source_file"], manifest["sources"][0]["path"])
+        self.assertEqual(entry["source_type"], "decision")
+        self.assertEqual(entry["source_sha256"], whole_hash)
+        self.assertEqual(entry["byte_offset"], len(b"\xef\xbb\xbf" + first + b"\r\n \t\r\n"))
+        self.assertEqual(entry["raw_line_sha256"], hashlib.sha256(bad).hexdigest())
+        self.assertEqual(entry["raw_line_length_bytes"], len(bad))
+        self.assertEqual(entry["line_length_chars"], len(bad[:-2].decode("utf-8")))
+        self.assertEqual(entry["parse_error_class"], "JSONDecodeError")
+        self.assertEqual(entry["quarantine_reason"], "malformed_unclassifiable")
+        self.assertNotIn("broken", entry["parse_error_message"])
+        for field in ("asset", "window_id_ts", "session_tag", "timestamp", "raw_contents"):
+            self.assertNotIn(field, entry)
+        self.assertEqual(Path(manifest["sources"][0]["path"]).read_bytes(), content)
+
+    def test_quarantine_multiple_first_last_lines_and_blanks(self):
+        content = b"{bad\n\n" + self.encoded(self.row()) + b"\r \t\r\n{last"
+        result = build(self.byte_sources(("decision", content), malformed_record_policy="quarantine"))
+        handling = result["schema_provenance"]["malformed_record_handling"]
+        self.assertEqual([r["source_line"] for r in handling["ledger"]], [1, 5])
+        self.assertEqual(result["preferred_ge_60s"][0]["source_line"], 3)
+        self.assertEqual(handling["accounting"], dict(physical_lines=5, blank_lines=2, candidate_records=3,
+                         parsed_records=1, quarantined_records=2, cohort_included_records=1, cohort_excluded_records=0))
+        self.assertTrue(handling["reconciles"])
+
+    def test_quarantine_does_not_infer_fence_membership(self):
+        content = (self.encoded(self.decision_at("2026-07-01T00:00:00Z")) + b"\n"
+                   + b'{"ts":"2026-07-01T00:00:00Z",\n'
+                   + self.encoded(self.decision_at("2026-08-15T00:00:00Z")) + b"\n"
+                   + b'{"ts":"2026-08-15T00:00:00Z",\n')
+        result = build(self.byte_sources(("decision", content), malformed_record_policy="quarantine", **self.fence()))
+        counts = result["schema_provenance"]["malformed_record_handling"]["accounting"]
+        self.assertEqual((counts["candidate_records"], counts["parsed_records"], counts["quarantined_records"]), (4, 2, 2))
+        self.assertEqual((counts["cohort_included_records"], counts["cohort_excluded_records"]), (1, 1))
+        fence = result["schema_provenance"]["cohort_fence"]
+        self.assertEqual((fence["records_before"], fence["records_after"], fence["records_excluded"]), (2, 1, 1))
+        self.assertEqual(result["preferred_ge_60s"][0]["source_line"], 3)
+
+    def test_quarantine_contributes_to_no_population_or_outcome(self):
+        decisions = self.encoded(self.row()) + b'\n{"asset":"ETH","reason":"signal_warmup",\n'
+        boundaries = self.encoded(self.boundary()) + b'\n{"record_kind":"window_outcome",\n{"record_kind":"boundary_snapshot",\n'
+        result = build(self.byte_sources(("decision", decisions), ("research_v2", boundaries), malformed_record_policy="quarantine"))
+        self.assertEqual(len(result["preferred_ge_60s"]), 1)
+        self.assertEqual(len(result["boundary_60"]), 1)
+        self.assertEqual(len(result["population_overlap"]), 1)
+        self.assertEqual(result["population_overlap"][0]["membership"], "both")
+        self.assertEqual(result["abstention_census"], [])
+        self.assertIsNone(result["preferred_ge_60s"][0]["outcome"])
+        self.assertIsNone(result["boundary_60"][0]["outcome"])
+        handling = result["schema_provenance"]["malformed_record_handling"]
+        self.assertEqual(handling["accounting"]["quarantined_records"], 3)
+        for field, total in handling["accounting"].items():
+            self.assertEqual(total, sum(s[field] for s in handling["by_source"]))
+
+    def test_valid_outcome_after_quarantine_retains_original_identity(self):
+        content = self.encoded(self.boundary()) + b"\n{bad\n" + self.encoded(self.outcome()) + b"\n"
+        result = build(self.byte_sources(("research_v2", content), malformed_record_policy="quarantine"))
+        outcome = result["boundary_60"][0]["outcome"]
+        self.assertEqual(outcome["provenance"]["source_line"], 3)
+        self.assertEqual(outcome["provenance"]["source_sha256"], hashlib.sha256(content).hexdigest())
+
+    def test_v1_surviving_preferred_row_semantics_are_unchanged(self):
+        content = b"{bad\n" + self.encoded(self.outcome(schema_version=1)) + b"\n"
+        result = build(self.byte_sources(("research_v1", content), malformed_record_policy="quarantine"))
+        row = result["preferred_ge_60s"][0]
+        self.assertEqual(row["source_line"], 2)
+        self.assertEqual(row["selection_rule"], RULE_V1)
+        self.assertIsNotNone(row["outcome"])
+
+    def test_quarantine_does_not_hide_non_json_integrity_errors(self):
+        bad_inputs = (b"[]\n", b"null\n", self.encoded({"ts": "invalid"}) + b"\n",
+                      self.encoded(self.decision_at("2026-08-15T00:00:00Z", window_id_ts=None)) + b"\n",
+                      b"\xff\n", self.encoded(self.row(reason="x\u2028y")) + b"\n")
+        for content in bad_inputs:
+            with self.subTest(content=content), self.assertRaises(ValueError):
+                build(self.byte_sources(("decision", content), malformed_record_policy="quarantine", **self.fence()))
+
+    def test_quarantine_rejects_prospective_live_and_runtime_store_inputs(self):
+        for settings in (dict(sample_kind="prospective"), dict(mode="live"), dict(session_tag="p6c_d1_validation")):
+            with self.subTest(settings=settings), self.assertRaises(ValueError):
+                build(self.byte_sources(("decision", b"{bad\n"), malformed_record_policy="quarantine", **settings))
+        manifest = self.byte_sources(("decision", b"{bad\n"), malformed_record_policy="quarantine")
+        # Guard fires before attempting to open the nonexistent runtime path.
+        manifest["sources"][0]["path"] = str(self.root / "research_data" / "source.jsonl")
+        with self.assertRaisesRegex(ValueError, "outside research_data"):
+            build(manifest)
+        for policy in (None, "skip", True):
+            with self.subTest(policy=policy), self.assertRaisesRegex(ValueError, "must be fail or quarantine"):
+                build(self.byte_sources(("decision", b"{bad\n"), malformed_record_policy=policy))
+
+    def test_clean_fenced_and_unfenced_builds_match_all_policies(self):
+        content = (self.encoded(self.decision_at("2026-07-01T00:00:00Z", window_id_ts=1)) + b"\r\n\r\n"
+                   + self.encoded(self.decision_at("2026-08-15T00:00:00Z", window_id_ts=2)) + b"\n")
+        for fence in ({}, self.fence()):
+            manifest = self.byte_sources(("decision", content), **fence)
+            default = build(manifest)
+            self.assertEqual(default, build(dict(manifest, malformed_record_policy="fail")))
+            explicit = build(dict(manifest, malformed_record_policy="quarantine"))
+            expected = copy.deepcopy(default)
+            expected["schema_provenance"]["malformed_record_handling"]["policy"] = "quarantine"
+            self.assertEqual(expected, explicit)
+
+    def test_quarantine_cli_authorization_conflicts_and_six_artifacts(self):
+        manifest = self.byte_sources(("decision", b"{bad\n"))
+        path = self.root / "manifest.json"
+        script = Path(__file__).resolve().parents[1] / "scripts" / "build_market_state_dataset.py"
+        for name, policy_in_manifest, option, succeeds in (
+            ("default", None, None, False), ("cli", None, "quarantine", True),
+            ("manifest", "quarantine", None, True), ("agree", "quarantine", "quarantine", True),
+            ("strict_conflict", "quarantine", "fail", False), ("quarantine_conflict", "fail", "quarantine", False),
+        ):
+            manifest.pop("malformed_record_policy", None)
+            if policy_in_manifest is not None:
+                manifest["malformed_record_policy"] = policy_in_manifest
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+            out = self.root / name
+            command = [sys.executable, str(script), str(path), "--out-dir", str(out)]
+            if option is not None:
+                command += ["--malformed-record-policy", option]
+            result = subprocess.run(command, capture_output=True, text=True)
+            with self.subTest(name=name):
+                self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+                if succeeds:
+                    self.assertEqual(len(list(out.iterdir())), 6)
+                    saved = json.loads((out / "schema_provenance.json").read_text(encoding="utf-8"))
+                    self.assertEqual(saved["malformed_record_handling"]["accounting"]["quarantined_records"], 1)
+                else:
+                    self.assertFalse(out.exists())
 
     def test_selection_and_separate_times(self):
         rows = [self.row(ts="first"), self.row(ts="last", time_remaining=60), self.row(ts="later", time_remaining=59), self.row(p_real=float("nan")), self.row(time_remaining=None)]

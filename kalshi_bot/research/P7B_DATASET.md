@@ -69,7 +69,8 @@ paths and writes four JSONL files and two JSON summaries:
   supplied decisions, with their last recorded recognized early reason,
   provenance, category, and window_count=1; no reconstructed feature state.
 - `schema_provenance.json`: ordered source paths and SHA-256 hashes, cohort,
-  taxonomy, exact rules and historical semantic limitations.
+  taxonomy, exact rules, historical semantic limitations, and malformed-record
+  policy/accounting/quarantine ledger.
 - `coverage_missingness.json`: population sizes, missing outcome counts and
   per-field observed/missing/structurally-unavailable counts; no scoring.
 
@@ -102,6 +103,89 @@ after, and excluded, including the same counts per source file. Counts are
 cohort-filter counts, not population sizes. `builder_schema_version` stays 2
 because selection and availability semantics are unchanged.
 `schema_provenance.sources` remains path, type, and hash only.
+
+## Optional historical malformed-record quarantine (P7B-HQ)
+
+Default behavior remains strict: malformed JSON fails the entire build, with or
+without a cohort fence. Neither a development label nor a date fence enables
+tolerance. Explicitly set manifest `malformed_record_policy` to `quarantine`,
+or supply `--malformed-record-policy quarantine`, to opt in. `fail` is the only
+other accepted value and the default when omitted. CLI/manifest disagreement
+fails before observations are read; an omitted CLI option preserves the
+manifest's policy. No file names, line numbers or dates are hardcoded.
+
+This option is restricted to `mode=paper` and `sample_kind=development` or
+`historical`. Prospective/live declarations and input paths under `research_data`
+are rejected in quarantine mode. The existing protected-path and P6-session
+checks remain. The policy does NOT authorize prospective/live research stores
+to silently tolerate malformed records. The operator must authorize a static,
+immutable-style historical reconstruction; a policy declaration is not proof
+that inputs are immutable or that unknown contents have a particular cohort.
+
+Example syntax for a separately approved reconstruction (not run in this pass):
+
+```powershell
+py -3 scripts/build_market_state_dataset.py offline_exports/manifest.json --out-dir reports/p7b_reconstruction --malformed-record-policy quarantine
+```
+
+Quarantine permits analysis of surviving parseable records from an immutable historical reconstruction. It does not establish that a quarantined record was outside the research cohort.
+
+Only `json.JSONDecodeError` is caught. A failed line becomes a
+`malformed_unclassifiable` ledger entry and contributes nothing to A, B,
+overlap, census or outcomes. It is never assigned a timestamp, asset, window,
+session or cohort membership. Processing resumes at the next physical line;
+valid records preserve their original order and source identity. No source is
+rewritten, repaired, normalized or supplemented. A partially readable timestamp
+inside a broken line is not evidence for cohort inclusion or exclusion.
+
+Encoding failures, successfully parsed non-object JSON, invalid keys, ambiguous
+or missing cohort clocks, schema/cohort conflicts and all other validation
+failures still abort. Python's existing JSON decoder behavior for parseable
+numeric constants is unchanged; this is not a new data-value cleaning policy.
+A later fatal error returns no successful build or partial quarantine artifact.
+
+`schema_provenance.malformed_record_handling` contains `policy`, `ledger`,
+aggregate `accounting`, `by_source` accounting, and explicit reconciliation
+results. The existing six output filenames and population schema version 2 are
+retained; metadata is additive. Ledger fields are:
+
+- source_file, source_type and source_sha256 (hash of the complete source bytes);
+- source_line (one-based original physical line) and byte_offset (zero-based);
+- line_length_chars (decoded parsing text, excluding line terminator and a
+  first-line UTF-8 BOM), raw_line_length_bytes and raw_line_sha256;
+- parse_error_class, parse_error_message, parse_error_column and
+  parse_error_position (decoder-relative character positions);
+- quarantine_reason = malformed_unclassifiable.
+
+Raw-line length/hash cover exact bytes including CR/LF/CRLF terminators and any
+first-line BOM. No raw text or parser document is copied into the ledger. The
+whole-file hash still includes all quarantined bytes and blank lines. A source
+path may name a session directory; that is file provenance, not inferred
+record-level session identity.
+
+Physical lines use CR, LF or CRLF; a final unterminated line still counts.
+Whitespace-only physical lines count as blank. UTF-8 decoding remains strict,
+with an optional first-line BOM. Embedded nonphysical Unicode/control line
+separators that would require the old text `splitlines()` segmentation fail
+closed rather than silently changing record boundaries or assigning misleading
+physical line numbers. Normal UTF-8 JSONL with CR/LF/CRLF retains its accepted
+selection, original line numbers and hashing behavior.
+
+For every source and the whole successful build, the checked identities are:
+
+```text
+physical_lines = blank_lines + candidate_records
+candidate_records = parsed_records + quarantined_records
+parsed_records = cohort_included_records + cohort_excluded_records
+```
+
+Candidates are physical nonblank lines. Counts of parsed/included/excluded
+records are not population sizes. Existing `cohort_fence.records_before` counts
+successfully parsed records; `records_after` and `records_excluded` retain
+included/excluded valid-record semantics. Quarantined records never inflate
+any of those three fence counts. Without a fence, all parsed records are
+cohort-included and cohort-excluded is zero. No acceptable-malformation rate,
+automatic quality verdict, or statistical analysis is introduced.
 
 Population A has distinct source-specific row-level `selection_rule` values,
 also exported in schema_provenance.selection_rules:
@@ -206,8 +290,9 @@ census coverage, and an empty census is not evidence of no abstention. Rotated
 or stripped exports may omit eligible rows or reasons, limiting conclusions to
 the supplied observations.
 
-Malformed JSON, invalid keys, schema conflicts and duplicate sidecars fail the
-build. Features must be JSON-serializable finite values for artifact writing;
+Malformed JSON fails by default; only the explicit historical policy above
+permits its quarantine. Invalid keys, schema conflicts and duplicate sidecars
+still fail the build. Features must be JSON-serializable finite values for artifact writing;
 nonfinite retained feature values cause an explicit serialization error. Inputs
 must be static and fit in memory. Writes are not a multi-file transaction; a
 serialization/I/O failure can leave a partial new output directory, which must
@@ -293,3 +378,26 @@ validation for this pass:
 - Engine suite: not run. Its paths can attempt live API traffic.
 
 No frozen historical reconstruction was built. Changes are uncommitted.
+
+## P7B-HQ validation
+
+Synthetic/adversarial validation against accepted baseline
+`d3bf8bb030863b87e22d36230a0623f2fe4e3b0e`:
+
+- P7B (`kalshi_bot.test_market_state_dataset`): 39 tests passed, including
+  11 new quarantine tests.
+- Variable quality (`kalshi_bot.test_variable_quality`): 31 tests passed.
+- Research store (`kalshi_bot.test_research_store`): 20/20 fixture checks passed.
+- Boundary store (`kalshi_bot.test_boundary_store`): 17/17 fixture checks passed.
+- Forecast history (`kalshi_bot.test_forecast_history`): 15/15 fixture checks passed.
+- Engine suite: not run.
+
+The guarded harness above was used with `loadTestsFromNames` for both P7B and
+variable-quality modules (70 tests total), followed by the three fixture suites.
+Dotenv loading was disabled and network connection/DNS calls were blocked in the
+test process. CLI integration tests used synthetic temporary inputs only.
+The existing forecast-history checks are regression fixtures, not a historical
+performance analysis. No actual-data P7B build or P7C analysis was run.
+
+The source snapshot, protected paths, prospective cohort and running bot were
+untouched. Implementation is left uncommitted and unpushed for independent review.
