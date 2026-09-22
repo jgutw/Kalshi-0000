@@ -9,6 +9,16 @@ Run from the repository root:
 py -3 scripts/build_market_state_dataset.py offline_exports/manifest.json --out-dir reports/p7b_review_001
 ```
 
+An optional observation cohort fence is off unless both bounds are supplied.
+Omitting both flags preserves the previous unfenced build. Supplying only one
+bound fails. The same keys may be set in the manifest as `start_utc` and
+`end_utc`; a CLI value that disagrees with the manifest fails. Example, not a
+default:
+
+```powershell
+py -3 scripts/build_market_state_dataset.py offline_exports/manifest.json --out-dir reports/p7b_review_001 --start-utc 2026-08-09T00:00:00Z --end-utc 2026-09-01T00:00:00Z
+```
+
 The output directory must be new. Inputs remain read-only. Paths containing
 `logs`, `sessions`, or `.env` are rejected; output beneath `research_data` is
 rejected. No default scan of historical or active data occurs. The explicit
@@ -62,6 +72,36 @@ paths and writes four JSONL files and two JSON summaries:
   taxonomy, exact rules and historical semantic limitations.
 - `coverage_missingness.json`: population sizes, missing outcome counts and
   per-field observed/missing/structurally-unavailable counts; no scoring.
+
+## Optional cohort fence
+
+The fence runs after JSON parsing and before Population A/B selection and the
+abstention census. It does not change `RULE_A`, `RULE_V1`, or `RULE_B`. With
+no bounds, every non-empty supplied record remains eligible for those rules.
+With both bounds, membership is `start <= cohort_time < end`. Excluded records
+are not rewritten, reordered, or replaced. Original path, SHA-256, and line
+numbers stay on the records that remain. Blank lines are not records.
+
+The cohort clock follows the source contract:
+
+- Decision rows, research v1 rows, and v2 `boundary_snapshot` rows use the
+  existing observation timestamp: `snapshot_ts` when that key is present,
+  otherwise `ts`. The value must be timezone-aware ISO-8601 (`Z` is UTC).
+  Naive, missing, or unparseable values fail the build. `window_id_ts` is the
+  window identity and is not a substitute clock. A non-null `ts` or
+  `capture_time_utc` that parses to a different instant than the primary clock
+  fails closed.
+- V2 `window_outcome` rows have no observation timestamp. Their clock is
+  integer `window_id_ts` as UTC unix seconds. `outcome_ts` and
+  `close_time_utc` are not cohort clocks. A non-null observation timestamp on
+  an outcome row makes membership ambiguous and fails closed.
+
+`schema_provenance.cohort_fence` records the requested bound strings, whether
+the fence was applied, the half-open interval, and record counts before,
+after, and excluded, including the same counts per source file. Counts are
+cohort-filter counts, not population sizes. `builder_schema_version` stays 2
+because selection and availability semantics are unchanged.
+`schema_provenance.sources` remains path, type, and hash only.
 
 Population A has distinct source-specific row-level `selection_rule` values,
 also exported in schema_provenance.selection_rules:
@@ -146,7 +186,9 @@ to replace a value with null. Missing spread remains null. Dislocation zero with
 fewer than two fresh venues never becomes an agreement label.
 
 The census contains only windows that never obtain an eligible Population A
-observation anywhere in the supplied decision files. After processing all files,
+observation anywhere in the supplied decision files. A cohort fence, when
+applied, defines that supplied set: rows outside the fence do not create or
+remove census entries. After processing all files,
 every Population A key is excluded from the reason candidates. Early warmup
 followed by eligibility and eligible/traded followed by position_open are both
 excluded. This is a supplied-forecast-eligibility census, not proof that a window
@@ -236,3 +278,18 @@ No commit, push, pull, merge, branch switch, or bot restart was performed.
 This correction changes only the builder, tests and this documentation within
 the original four untracked P7B additions; the CLI is unchanged. Independent
 Cursor re-review is the next step.
+
+## P7B-H cohort fence
+
+The fence is optional infrastructure. It does not run a population build on
+historical archives and it does not hardcode an August cohort. Safe offline
+validation for this pass:
+
+- P7B (`kalshi_bot.test_market_state_dataset`): 28 tests passed.
+- Variable quality (`kalshi_bot.test_variable_quality`): 31 tests passed.
+- Research store (`kalshi_bot.test_research_store`): 20/20 checks passed.
+- Boundary store (`kalshi_bot.test_boundary_store`): 17/17 checks passed.
+- Forecast history (`kalshi_bot.test_forecast_history`): 15/15 checks passed.
+- Engine suite: not run. Its paths can attempt live API traffic.
+
+No frozen historical reconstruction was built. Changes are uncommitted.
