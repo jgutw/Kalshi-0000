@@ -20,17 +20,23 @@ class ShadowTests(unittest.TestCase):
         params = dict(root=self.root, shadow_session_id="test-1", session_tag="shadow-era-1",
                       code_sha="a" * 40)
         params.update(kwargs)
-        return ShadowSession(**params)
+        session = ShadowSession(**params)
+        self.addCleanup(session.close)
+        return session
+
+    def order(self, client, count=2, **kwargs):
+        return client.place_market_order("BTC", "yes", count, asset="BTC", window_id_ts=900,
+                                        decision_id="decision-1", strategy="test", **kwargs)
 
     def test_intent_never_network_or_fill(self):
         with patch("socket.socket", side_effect=AssertionError("network forbidden")):
             client = ShadowClient(self.session(), markets={"BTC": {"ticker": "BTC"}})
-            result = client.place_market_order("BTC", "yes", 2, limit_price=.4)
+            result = self.order(client, limit_price=.4)
             self.assertFalse(result)
             self.assertFalse(result.ok)
             self.assertEqual(result.fill_count, 0)
-            row = json.loads((self.root / "test-1" / "intended_orders.jsonl").read_text())
-            self.assertEqual((row["mode"], row["count"]), ("SHADOW", 2))
+            row = json.loads((self.root / "test-1" / "lifecycle.jsonl").read_text())
+            self.assertEqual((row["mode"], row["payload"]["request"]["count"]), ("SHADOW", 2))
             self.assertEqual(client.get_market("BTC"), {"ticker": "BTC"})
             for name in ("_post", "request", "cancel_order", "amend_order", "batch_orders",
                          "intra_transfer_shards", "ensure_crypto_shard_funded"):
@@ -101,10 +107,10 @@ class ShadowTests(unittest.TestCase):
         client = ShadowClient(self.session())
         for count in (0, -1, True):
             with self.assertRaises(ValueError):
-                client.place_market_order("BTC", "yes", count)
+                self.order(client, count=count)
         with self.assertRaises(ValueError):
-            client.place_market_order("BTC", "yes", 1, limit_price=float("nan"))
-        self.assertFalse((self.root / "test-1" / "intended_orders.jsonl").exists())
+            self.order(client, count=1, limit_price=float("nan"))
+        self.assertEqual((self.root / "test-1" / "lifecycle.jsonl").read_bytes(), b"")
 
     def test_actual_live_start_guard_before_dependencies(self):
         # Import the real helper with inert dependencies: no config/.env import.
