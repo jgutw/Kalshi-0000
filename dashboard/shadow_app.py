@@ -136,6 +136,24 @@ def main() -> None:
         st.write("Gross P&L by strategy", perf["by_strategy"])
         st.caption(f"Average winner {_money(perf['average_winner'])} · average loser {_money(perf['average_loser'])}")
 
+        st.subheader("Gross equity ledger")
+        equity = report["equity"]
+        if not equity or not equity["available"]:
+            st.info("Gross equity unavailable. It is not invented from a missing starting balance or an incomplete close.")
+        else:
+            st.caption(equity["basis"])
+            ecols = st.columns(4)
+            ecols[0].metric("Realized equity", _money(equity["realized_equity"]))
+            ecols[1].metric("Cash (gross)", _money(equity["cash_gross"]))
+            ecols[2].metric("Gross exposure", _money(equity["gross_exposure"]))
+            ecols[3].metric("Concurrent open", equity["concurrent_open"])
+            dcols = st.columns(4)
+            dcols[0].metric("Peak realized", _money(equity["peak_realized_equity"]))
+            dcols[1].metric("Drawdown $", _money(equity["drawdown_usd"]))
+            dcols[2].metric("Drawdown %", _money(equity["drawdown_pct"]))
+            dcols[3].metric("Cumulative return", _money(equity["cumulative_return"]))
+            st.caption("Fees unknown. Net equity is unavailable. This ledger does not change order size.")
+
     st.subheader("Operational incidents")
     st.dataframe(report["incidents"], width="stretch", hide_index=True)
 

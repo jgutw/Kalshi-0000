@@ -78,6 +78,12 @@ class ReportTests(unittest.TestCase):
         empty.close()
         report = analyze(empty.directory, now=WHEN)
         self.assertEqual(report["decisions"]["total"], 1)
+        self.assertEqual(report["equity"]["realized_equity"], 1000.0)
+        self.assertEqual(report["equity"]["gross_exposure"], 0.0)
+        self.assertEqual(report["equity"]["drawdown_usd"], 0.0)
+        self.assertIsNone(report["equity"]["fees"])
+        self.assertIsNone(report["equity"]["net_equity"])
+        self.assertFalse(report["equity"]["equity_feeds_sizing"])
         self.assertEqual(report["funnel"]["intended"], 0)
         self.assertTrue(report["lifecycle_chain_ok"])
         self.assertIsNone(report["performance"]["win_rate"])
@@ -103,6 +109,10 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(report["funnel"]["open"], 1)
         self.assertEqual(report["open_positions"][0]["price_to_beat"], 100.0)
         self.assertGreater(report["open_positions"][0]["seconds_to_boundary"], 0)
+        self.assertEqual(report["equity"]["realized_equity"], 1000.0)
+        self.assertEqual(report["equity"]["gross_exposure"], 10.0)
+        self.assertEqual(report["equity"]["cash_gross"], 990.0)
+        self.assertEqual(report["equity"]["concurrent_open"], 1)
 
         cases = [
             ("yes-win", "BTC", "BUY_YES", {"yes": [[0.39, 100]], "no": [[0.60, 100]]}, 110.0, 15.0, 1),
@@ -127,6 +137,8 @@ class ReportTests(unittest.TestCase):
                 self.assertEqual(close["yes_settled"], settled)
                 if gross is not None:
                     self.assertEqual(close["gross_pnl"], gross)
+                    self.assertEqual(report["equity"]["realized_equity"], 1000.0 + gross)
+                    self.assertIsNone(report["equity"]["net_equity"])
                 else:
                     self.assertEqual(
                         close["gross_pnl"],
@@ -157,6 +169,7 @@ class ReportTests(unittest.TestCase):
         self.assertIsNone(broken["open_positions"])
         self.assertIsNone(broken["closed_positions"])
         self.assertIsNone(broken["funnel"]["intended"])
+        self.assertIsNone(broken["equity"])
         self.assertGreater(broken["decisions"]["total"], 0)
 
     def _closed_session(self, sid="chain"):
@@ -172,6 +185,21 @@ class ReportTests(unittest.TestCase):
 
     def _write_lines(self, path, lines):
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def test_realized_equity_drawdown_after_a_later_loss(self):
+        session = _session(self.root, "dd")
+        _fill(session, "BTC", "BUY_YES", {"yes": [[0.39, 100]], "no": [[0.60, 100]]}, 110.0, decision_id="win")
+        _fill(session, "ETH", "BUY_NO", {"yes": [[0.40, 100]], "no": [[0.39, 100]]}, 110.0,
+              window=WINDOW + 900, decision_id="loss")
+        session.close()
+        report = analyze(session.directory, now=datetime.fromtimestamp(WINDOW + 1800, tz=timezone.utc))
+        equity = report["equity"]
+        self.assertEqual(equity["peak_realized_equity"], 1015.0)
+        self.assertAlmostEqual(equity["realized_equity"], 1005.4)
+        self.assertAlmostEqual(equity["drawdown_usd"], 9.6)
+        self.assertAlmostEqual(equity["drawdown_pct"], 9.6 / 1015.0)
+        self.assertAlmostEqual(equity["cumulative_return"], 5.4 / 1000.0)
+        self.assertIsNone(equity["net_equity"])
 
     def test_torn_tail_keeps_verified_prefix(self):
         session = self._closed_session("torn")

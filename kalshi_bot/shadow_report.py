@@ -207,6 +207,83 @@ def _performance(closed: list[dict]) -> dict:
     }
 
 
+def _equity(starting, closed_rows, open_rows) -> dict:
+    """Gross equity from the lifecycle. Fees stay unknown. Open positions are not marked.
+
+    Realized equity is starting balance plus closed gross P&L. An open premium
+    is still inside that number at cost. Cash is realized equity minus open premium.
+    This ledger does not change the sizer. The engine keeps using the frozen
+    starting balance for Kelly and the position cap.
+    """
+    blank = {
+        "available": False,
+        "starting_gross_equity": None,
+        "realized_pnl": None,
+        "realized_equity": None,
+        "cash_gross": None,
+        "gross_exposure": None,
+        "exposure_pct_of_starting": None,
+        "concurrent_open": None,
+        "peak_realized_equity": None,
+        "drawdown_usd": None,
+        "drawdown_pct": None,
+        "cumulative_return": None,
+        "fees": None,
+        "net_equity": None,
+        "equity_feeds_sizing": False,
+        "basis": "unavailable",
+    }
+    if type(starting) not in (int, float) or isinstance(starting, bool) or starting <= 0:
+        blank["basis"] = "starting balance missing; equity not invented"
+        return blank
+    start = float(starting)
+    ordered = []
+    for row in closed_rows:
+        pnl = _num(row.get("gross_pnl"))
+        if pnl is None:
+            blank["basis"] = "closed position missing gross P&L; equity withheld"
+            return blank
+        ordered.append((str(row.get("closed_utc") or ""), pnl))
+    running = start
+    peak = start
+    for _when, pnl in sorted(ordered, key=lambda item: item[0]):
+        running += pnl
+        if running > peak:
+            peak = running
+    realized_pnl = running - start
+    premium = 0.0
+    for row in open_rows:
+        qty = _num(row.get("quantity"))
+        entry = _num(row.get("entry"))
+        if qty is None or entry is None:
+            blank["basis"] = "open position missing premium; equity withheld"
+            return blank
+        premium += qty * entry
+    drawdown = peak - running
+    return {
+        "available": True,
+        "starting_gross_equity": start,
+        "realized_pnl": realized_pnl,
+        "realized_equity": running,
+        "cash_gross": running - premium,
+        "gross_exposure": premium,
+        "exposure_pct_of_starting": premium / start,
+        "concurrent_open": len(open_rows),
+        "peak_realized_equity": peak,
+        "drawdown_usd": drawdown,
+        "drawdown_pct": drawdown / peak if peak > 0 else None,
+        "cumulative_return": (running / start) - 1.0,
+        "fees": None,
+        "net_equity": None,
+        "equity_feeds_sizing": False,
+        "basis": (
+            "Gross realized equity. Open positions carried at cost, not marked. "
+            "Fees unknown, so net equity is unavailable. "
+            "Sizing still uses the frozen starting balance."
+        ),
+    }
+
+
 def _seconds_to_boundary(window_id, now: datetime) -> float | None:
     if type(window_id) is not int:
         return None
@@ -297,6 +374,7 @@ def analyze(session_dir: Path, now: datetime | None = None) -> dict:
     intended = replay["intended"] if chain_ok else None
     not_filled = sum(count for name, count in dispositions.items() if name != FULL) if chain_ok else None
     perf = _performance(closed_rows) if chain_ok else None
+    equity = _equity(starting, closed_rows, open_rows) if chain_ok else None
     if not chain_ok:
         open_rows = None
         closed_rows = None
@@ -369,6 +447,7 @@ def analyze(session_dir: Path, now: datetime | None = None) -> dict:
         "open_positions": open_rows,
         "closed_positions": closed_rows,
         "performance": perf,
+        "equity": equity,
         "labels": [
             "SHADOW / NO CAPITAL",
             "RESEARCH SETTLEMENT — NOT OFFICIAL KALSHI SETTLEMENT",
@@ -412,6 +491,19 @@ def render(report: dict) -> str:
             f"win_rate={perf['win_rate']} profit_factor={perf['profit_factor']} "
             "fees=null net_pnl=null"
         )
+        equity = report["equity"]
+        if equity and equity["available"]:
+            lines.append(
+                "equity "
+                f"start={equity['starting_gross_equity']} realized={equity['realized_equity']} "
+                f"cash={equity['cash_gross']} exposure={equity['gross_exposure']} "
+                f"concurrent={equity['concurrent_open']} peak={equity['peak_realized_equity']} "
+                f"drawdown_usd={equity['drawdown_usd']} drawdown_pct={equity['drawdown_pct']} "
+                f"return={equity['cumulative_return']} fees=null net_equity=null "
+                "equity_feeds_sizing=false"
+            )
+        else:
+            lines.append("equity unavailable")
     if report["lifecycle_chain_note"]:
         lines.append(f"chain_note={report['lifecycle_chain_note']}")
     return "\n".join(lines)
