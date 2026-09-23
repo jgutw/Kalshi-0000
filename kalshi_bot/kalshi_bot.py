@@ -36,8 +36,6 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-import websockets
-
 from .api_config import api_cfg
 from .config import cfg, ASSETS, AssetSpec, all_asset_symbols
 from .data.kraken_feed import SYMBOL_TO_PAIR as KRAKEN_PAIRS
@@ -49,6 +47,8 @@ from .live_guard import LiveGuard
 from .asset_engine import AssetEngine
 from .recorder import EventRecorder
 from .research_store import ResearchForecastStore
+from .data.binance_feed import run_binance_feed
+from .data.okx_feed import run_okx_feed
 from .data.coinbase_feed import run_coinbase_microstructure as run_coinbase_microstructure_feed
 from .data.kraken_feed import run_kraken as run_kraken_feed
 from .data.gemini_feed import run_gemini as run_gemini_feed
@@ -322,101 +322,29 @@ class KalshiMultiBot:
         Optional aggTrade + depth20 stream.
         US IPs get HTTP 451 — stop cleanly so Coinbase/OKX/Kraken are unaffected.
         """
-        sym  = spec.binance_symbol.lower()
-        url  = f"{api_cfg.BINANCE_WS}?streams={sym}@aggTrade/{sym}@depth20@100ms"
         engine = self.engines[spec.symbol]
-        sig    = engine.signal
-        log.info(f"[{spec.symbol}] Binance stream (optional): {sym}")
-        geo_block_logged = False
-        while True:
-            try:
-                async with websockets.connect(url, ping_interval=20) as ws:
-                    async for raw in ws:
-                        data   = json.loads(raw)
-                        stream = data.get("stream", "")
-                        pl     = data.get("data", data)
-                        if "aggTrade" in stream:
-                            sig.update_trade_binance(
-                                float(pl["p"]), float(pl["q"]), pl["m"]
-                            )
-                        elif "depth20" in stream:
-                            bids, asks = pl.get("bids", []), pl.get("asks", [])
-                            sig.update_book_binance(bids, asks)
-                            if bids and asks:
-                                try:
-                                    best_bid = max(float(b[0]) for b in bids if len(b) >= 1 and float(b[0]) > 0)
-                                    best_ask = min(float(a[0]) for a in asks if len(a) >= 1 and float(a[0]) > 0)
-                                    if best_bid > 0 and best_ask > 0:
-                                        engine.synthetic_spot.update("binance", (best_bid + best_ask) / 2)
-                                except (ValueError, IndexError):
-                                    pass
-            except Exception as e:
-                err = str(e)
-                if "451" in err or "Unavailable for legal reasons" in err:
-                    if not geo_block_logged:
-                        log.warning(
-                            f"[{spec.symbol}] Binance geo-blocked (451) — disabling feed; "
-                            "using Coinbase/OKX/Kraken only"
-                        )
-                        geo_block_logged = True
-                    return
-                log.error(f"[{spec.symbol}] Binance error: {e} — retry in 30s")
-                await asyncio.sleep(30)
+        await run_binance_feed(
+            spec.symbol,
+            spec.binance_symbol,
+            api_cfg.BINANCE_WS,
+            on_trade=engine.signal.update_trade_binance,
+            on_book=engine.signal.update_book_binance,
+            on_spot=engine.synthetic_spot.update,
+        )
 
     # ─── OKX WebSocket ────────────────────────────────────────────────────────
 
     async def run_okx(self, spec: AssetSpec) -> None:
         """books5 + trades for one asset from OKX."""
-        inst_id = spec.okx_inst_id
-        url     = api_cfg.OKX_WS
-        engine  = self.engines[spec.symbol]
-        sig     = engine.signal
-        log.info(f"[{spec.symbol}] OKX stream: {inst_id}")
-        while True:
-            try:
-                async with websockets.connect(url, ping_interval=25) as ws:
-                    sub = {
-                        "op": "subscribe",
-                        "args": [
-                            {"channel": "books5", "instId": inst_id},
-                            {"channel": "trades",  "instId": inst_id},
-                        ],
-                    }
-                    await ws.send(json.dumps(sub))
-                    async for raw in ws:
-                        data    = json.loads(raw)
-                        if "event" in data:
-                            if data.get("event") == "error":
-                                log.error(f"[{spec.symbol}] OKX error: {data}")
-                            continue
-                        channel = data.get("arg", {}).get("channel", "")
-                        pl      = data.get("data", [])
-                        if not pl:
-                            continue
-                        if channel == "books5":
-                            snap = pl[0] if isinstance(pl[0], dict) else {}
-                            bids, asks = snap.get("bids", []), snap.get("asks", [])
-                            sig.update_book_okx(bids, asks)
-                            # Update synthetic spot from OKX book
-                            if bids and asks:
-                                try:
-                                    best_bid = max(float(b[0]) for b in bids if len(b) >= 1 and float(b[0]) > 0)
-                                    best_ask = min(float(a[0]) for a in asks if len(a) >= 1 and float(a[0]) > 0)
-                                    if best_bid > 0 and best_ask > 0:
-                                        engine.synthetic_spot.update("okx", (best_bid + best_ask) / 2)
-                                except (ValueError, IndexError):
-                                    pass
-                        elif channel == "trades":
-                            for t in pl:
-                                if isinstance(t, dict):
-                                    px   = float(t.get("px",   0))
-                                    sz   = float(t.get("sz",   0))
-                                    side = t.get("side", "buy")
-                                    if px > 0 and sz > 0:
-                                        sig.update_trade_okx(px, sz, side)
-            except Exception as e:
-                log.error(f"[{spec.symbol}] OKX error: {e} — retry in 5s")
-                await asyncio.sleep(5)
+        engine = self.engines[spec.symbol]
+        await run_okx_feed(
+            spec.symbol,
+            spec.okx_inst_id,
+            api_cfg.OKX_WS,
+            on_trade=engine.signal.update_trade_okx,
+            on_book=engine.signal.update_book_okx,
+            on_spot=engine.synthetic_spot.update,
+        )
 
     # ─── Coinbase Advanced Trade WebSocket (primary — US-available) ─────────────
 
