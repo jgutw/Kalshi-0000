@@ -1,5 +1,6 @@
 """Offline Shadow entry pipeline. No live sockets and no production artifacts."""
 import ast
+import asyncio
 import base64
 import time
 import inspect
@@ -103,8 +104,8 @@ def _decision(**overrides):
 class Stub:
     def __init__(self):
         self.spec = SimpleNamespace(symbol="BTC", series_ticker="KXBTC15M")
-        self.signal = SimpleNamespace(prices=[])
-        self.synthetic_spot = SimpleNamespace(spot_mid=None)
+        self.signal = SimpleNamespace(prices=[], trades=[], is_ready=lambda: False)
+        self.synthetic_spot = SimpleNamespace(spot_mid=None, source_count=0, staleness=0.0)
         self._ticker = "KX-T"
         self._window_id = 1_700_000_000
         self._window_start = float(self._window_id)
@@ -491,6 +492,11 @@ class BoundaryTests(unittest.TestCase):
         self.assertNotIn("KalshiMultiBot", names)
         self.assertNotIn("_execute", text)
         self.assertNotIn("SimState.load", text)
+        self.assertIn("asyncio.to_thread", text)
+        self.assertNotIn("requests.post", text)
+        market_source = inspect.getsource(ReadOnlyKalshi)
+        self.assertNotIn(".post(", market_source)
+        self.assertNotIn("requests.post", market_source)
 
     def test_cli_rejects_live_fresh_round_and_p6_tag(self):
         base = ["--session-id", "s", "--session-tag", "era1", "--new", "--code-sha", SHA, "--starting-balance", "10"]
@@ -712,6 +718,226 @@ class BoundaryTests(unittest.TestCase):
             SimState.load = original
         self.assertEqual(sim.balance, 250.0)
         self.assertEqual(sim.starting_balance, 250.0)
+
+
+class EventLoopSchedulingTests(unittest.TestCase):
+    def test_yes_mid_read_does_not_block_the_event_loop(self):
+        asyncio.run(self._yes_mid_off_loop())
+
+    async def _yes_mid_off_loop(self):
+        ticks = []
+        depth = []
+        started = asyncio.Event()
+
+        loop = asyncio.get_running_loop()
+
+        def get_yes_mid(ticker):
+            loop.call_soon_threadsafe(started.set)
+            time.sleep(0.4)
+            depth.append(len(ticks))
+            return 0.40
+
+        engine = SimpleNamespace(
+            spec=SimpleNamespace(symbol="BTC", series_ticker="KXBTC15M"),
+            _ticker="KX-T", _total_ticks=0, _window_id=1,
+            signal=SimpleNamespace(prices=[], trades=[], is_ready=lambda: False),
+            synthetic_spot=SimpleNamespace(spot_mid=None, source_count=0, staleness=0.0),
+        )
+        pipeline = SimpleNamespace(
+            market=SimpleNamespace(get_yes_mid=get_yes_mid, find_active_market=lambda series: None),
+            refresh_window=lambda engine: None,
+            apply_active_market=lambda engine, found: None,
+            evaluate=lambda engine, yes: ({"action": "WAIT", "reason": "signal_warmup"}, None),
+            operational=lambda *args, **kwargs: None,
+        )
+
+        async def sentinel():
+            await started.wait()
+            for _ in range(4):
+                ticks.append(1)
+                await asyncio.sleep(0.05)
+
+        price = asyncio.create_task(run_shadow._price_loop(pipeline, engine, FeedTelemetry()))
+        await sentinel()
+        for _ in range(40):
+            if depth:
+                break
+            await asyncio.sleep(0.02)
+        price.cancel()
+        await asyncio.gather(price, return_exceptions=True)
+        self.assertGreaterEqual(depth[0], 3)
+
+    def test_window_lookup_does_not_block_the_event_loop(self):
+        asyncio.run(self._window_lookup_off_loop())
+
+    async def _window_lookup_off_loop(self):
+        ticks = []
+        depth = []
+        started = asyncio.Event()
+
+        loop = asyncio.get_running_loop()
+
+        def find_active_market(series):
+            self.assertEqual(series, "KXBTC15M")
+            loop.call_soon_threadsafe(started.set)
+            time.sleep(0.4)
+            depth.append(len(ticks))
+            return {"ticker": "KX-NEW", "close_time": "2099-01-01T00:00:00Z"}
+
+        engine = SimpleNamespace(
+            spec=SimpleNamespace(symbol="BTC", series_ticker="KXBTC15M"),
+            _ticker="", _total_ticks=0, _window_id=1,
+            signal=SimpleNamespace(prices=[], trades=[], is_ready=lambda: False),
+            synthetic_spot=SimpleNamespace(spot_mid=None, source_count=0, staleness=0.0),
+        )
+        applied = []
+
+        def apply_active_market(engine, found):
+            applied.append(found)
+            engine._ticker = found.get("ticker", "")
+
+        pipeline = SimpleNamespace(
+            market=SimpleNamespace(
+                find_active_market=find_active_market,
+                get_yes_mid=lambda ticker: None,
+            ),
+            refresh_window=lambda engine: "KXBTC15M",
+            apply_active_market=apply_active_market,
+            evaluate=lambda engine, yes: ({"action": "WAIT"}, None),
+            operational=lambda *args, **kwargs: None,
+        )
+
+        async def sentinel():
+            await started.wait()
+            for _ in range(4):
+                ticks.append(1)
+                await asyncio.sleep(0.05)
+
+        price = asyncio.create_task(run_shadow._price_loop(pipeline, engine, FeedTelemetry()))
+        await sentinel()
+        for _ in range(40):
+            if depth:
+                break
+            await asyncio.sleep(0.02)
+        price.cancel()
+        await asyncio.gather(price, return_exceptions=True)
+        self.assertGreaterEqual(depth[0], 3)
+        self.assertEqual(applied[0]["ticker"], "KX-NEW")
+
+    def test_price_loop_preserves_wait_decision(self):
+        asyncio.run(self._wait_decision())
+
+    async def _wait_decision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "shadow_data"
+            root.mkdir()
+            session = _session(root, "sched-wait")
+            market = Market(session)
+            market.get_yes_mid = lambda ticker: 0.40
+            pipeline = ShadowEntry(session, market)
+            engine = Stub()
+            engine._get_window_id = lambda: engine._window_id
+            engine.next_decision = _decision(action="WAIT", reason="from-decision", size_usd=0)
+            direct_engine = Stub()
+            direct_engine.next_decision = _decision(action="WAIT", reason="from-decision", size_usd=0)
+            direct = pipeline.on_yes_mid(direct_engine, 0.40)
+            price = asyncio.create_task(run_shadow._price_loop(pipeline, engine, FeedTelemetry()))
+            path = session.directory / "decisions.jsonl"
+            for _ in range(50):
+                if path.exists() and path.read_text(encoding="utf-8").count("from-decision") >= 2:
+                    break
+                await asyncio.sleep(0.05)
+            price.cancel()
+            await asyncio.gather(price, return_exceptions=True)
+            rows = path.read_text(encoding="utf-8")
+            self.assertEqual(direct["reason"], "from-decision")
+            self.assertGreaterEqual(rows.count("from-decision"), 2)
+            self.assertEqual(market.calls, [])
+            session.close()
+
+    def test_execution_book_read_does_not_block_and_follows_intend(self):
+        asyncio.run(self._book_off_loop())
+
+    async def _book_off_loop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "shadow_data"
+            root.mkdir()
+            session = _session(root, "sched-book")
+            market = Market(session)
+            market.get_yes_mid = lambda ticker: 0.40
+            ticks = []
+            depth = []
+            started = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            original = market.fetch_execution_book
+
+            def fetch(ticker):
+                market.calls.append((ticker, set(session.journal.state["orders"])))
+                loop.call_soon_threadsafe(started.set)
+                time.sleep(0.4)
+                depth.append(len(ticks))
+                return original(ticker)
+
+            market.fetch_execution_book = fetch
+            pipeline = ShadowEntry(session, market)
+            engine = Stub()
+            engine._get_window_id = lambda: engine._window_id
+            engine.next_decision = _decision()
+
+            async def sentinel():
+                await started.wait()
+                for _ in range(4):
+                    ticks.append(1)
+                    await asyncio.sleep(0.05)
+
+            price = asyncio.create_task(run_shadow._price_loop(pipeline, engine, FeedTelemetry()))
+            await sentinel()
+            for _ in range(40):
+                if engine._open_pos is not None:
+                    break
+                await asyncio.sleep(0.02)
+            price.cancel()
+            await asyncio.gather(price, return_exceptions=True)
+            self.assertGreaterEqual(depth[0], 3)
+            self.assertTrue(market.calls[0][1])
+            self.assertEqual(_kinds(session), ["INTENDED", "SIMULATED_EXECUTION"])
+            self.assertIsNotNone(engine._open_pos)
+            session.close()
+
+    def test_series_verification_does_not_block_the_event_loop(self):
+        asyncio.run(self._verify_off_loop())
+
+    async def _verify_off_loop(self):
+        ticks = []
+        depth = []
+        started = asyncio.Event()
+
+        loop = asyncio.get_running_loop()
+
+        def verify_series(series):
+            loop.call_soon_threadsafe(started.set)
+            time.sleep(0.4)
+            depth.append(len(ticks))
+            return True
+
+        market = SimpleNamespace(verify_series=verify_series)
+        engines = {"BTC": SimpleNamespace(spec=SimpleNamespace(symbol="BTC", series_ticker="KXBTC15M"))}
+
+        async def sentinel():
+            await started.wait()
+            for _ in range(4):
+                ticks.append(1)
+                await asyncio.sleep(0.05)
+
+        task = asyncio.create_task(run_shadow._disable_unverified(market, engines))
+        await sentinel()
+        await task
+        for _ in range(40):
+            if depth:
+                break
+            await asyncio.sleep(0.02)
+        self.assertGreaterEqual(depth[0], 3)
+        self.assertIn("BTC", engines)
 
 
 if __name__ == "__main__":

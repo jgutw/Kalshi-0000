@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
@@ -64,7 +65,7 @@ def sign_get(api_key: str, private_key_pem: str, path: str) -> dict:
 class ReadOnlyKalshi:
     """Market discovery, quotes, and order books. Writes are absent, not disabled."""
 
-    __slots__ = ("_base", "_api_key", "_private_key", "_transport", "_last_get_ok")
+    __slots__ = ("_base", "_api_key", "_private_key", "_transport", "_last_get_ok", "_call_lock")
 
     def __init__(self, base_url: str, api_key: str, private_key_pem: str,
                  transport: Callable[..., Any]):
@@ -73,8 +74,14 @@ class ReadOnlyKalshi:
         self._private_key = private_key_pem
         self._transport = transport
         self._last_get_ok = False
+        # Serializes sign + transport + _last_get_ok. Held only on the calling thread.
+        self._call_lock = threading.RLock()
 
     def _get(self, path: str, params: Optional[dict] = None, timeout: int = 8) -> dict | list:
+        with self._call_lock:
+            return self._get_locked(path, params, timeout)
+
+    def _get_locked(self, path: str, params: Optional[dict], timeout: int) -> dict | list:
         url = self._base + path
         sign_path = urlparse(url).path
         headers = sign_get(self._api_key, self._private_key, sign_path)
@@ -190,6 +197,10 @@ class ReadOnlyKalshi:
 
     def fetch_execution_book(self, ticker: str, depth: int = 100) -> dict:
         """One execution observation. Failure raises; it does not retry."""
+        with self._call_lock:
+            return self._fetch_execution_book_locked(ticker, depth)
+
+    def _fetch_execution_book_locked(self, ticker: str, depth: int) -> dict:
         data = self._get(f"/markets/{ticker}/orderbook", params={"depth": depth})
         if not self._last_get_ok or not isinstance(data, dict) or not data:
             raise BookReadError(f"execution book unavailable for {ticker}")

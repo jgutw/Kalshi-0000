@@ -17,7 +17,7 @@ import uuid
 from .asset_engine import _floor_strike_from_market
 from .config import cfg
 from .shadow_journal import JournalError, strict_loads
-from .shadow_market import BookIdentityError, BookReadError
+from .shadow_market import BookIdentityError
 from .sim_state import OpenPosition, SimState
 
 log = logging.getLogger("kalshi_bot.shadow_entry")
@@ -123,11 +123,15 @@ class ShadowEntry:
         self.session.append("operational_events", payload)
         log.warning("shadow %s %s", event, fields)
 
-    def refresh_window(self, engine) -> None:
-        """Safe prefix of on_window_advance. Does not resolve, save, or research-finalize."""
+    def refresh_window(self, engine) -> str | None:
+        """Local window-roll bookkeeping. Returns a series ticker when a lookup is required.
+
+        The Kalshi GET stays with the caller so the event loop can run it off-thread.
+        Does not resolve, save, or research-finalize.
+        """
         wid = engine._get_window_id()
         if wid == engine._window_id:
-            return
+            return None
         if engine._open_pos is not None:
             self.operational(
                 "window_rolled_position_remains_open",
@@ -139,7 +143,10 @@ class ShadowEntry:
         engine._window_start = float(wid)
         engine._last_decision = None
         engine._window_fills = []
-        market = self.market.find_active_market(engine.spec.series_ticker)
+        return engine.spec.series_ticker
+
+    def apply_active_market(self, engine, market) -> None:
+        """Install a fetched market and price-to-beat. No network."""
         if market:
             engine._market = market
             engine._ticker = market.get("ticker", "")
@@ -165,8 +172,8 @@ class ShadowEntry:
                     engine._price_to_beat = price
                     engine._price_to_beat_source = "window_open_spot"
 
-    def on_yes_mid(self, engine, yes_prob: float, now: float | None = None) -> dict:
-        """Decision cadence without _execute, early exit, or the production decision log."""
+    def evaluate(self, engine, yes_prob: float, now: float | None = None) -> tuple[dict, dict | None]:
+        """Decision and durable INTENDED, without the execution-book GET."""
         now = time.time() if now is None else now
         if engine.signal.prices:
             engine.lag_tracker.update(float(engine.signal.prices[-1]), yes_prob)
@@ -174,15 +181,23 @@ class ShadowEntry:
             unchanged = abs(yes_prob - engine._last_price_val) < 1e-6
             if unchanged and now - engine._last_price_ts > cfg.PRICE_MAX_AGE_SECS:
                 decision = engine._wait("stale_price", yes_prob)
-                return self.submit(engine, decision, yes_prob)
+                return decision, self.stage_submission(engine, decision, yes_prob)
         engine._last_price_ts = now
         engine._last_price_val = yes_prob
         engine._kalshi_prob_history.append((now, yes_prob))
         if not engine._ticker:
-            return self.submit(engine, engine._wait("no_market", yes_prob), yes_prob)
+            decision = engine._wait("no_market", yes_prob)
+            return decision, self.stage_submission(engine, decision, yes_prob)
         engine._total_ticks += 1
         decision = engine.make_decision(yes_prob)
-        return self.submit(engine, decision, yes_prob)
+        return decision, self.stage_submission(engine, decision, yes_prob)
+
+    def on_yes_mid(self, engine, yes_prob: float, now: float | None = None) -> dict:
+        """Decision cadence without _execute, early exit, or the production decision log."""
+        decision, staged = self.evaluate(engine, yes_prob, now)
+        if staged is not None:
+            self.observe_book(engine, staged)
+        return decision
 
     def _record(self, engine, decision: dict, yes_mid: float) -> None:
         if not decision.get("decision_id"):
@@ -238,33 +253,40 @@ class ShadowEntry:
             )
 
     def submit(self, engine, decision: dict, yes_mid: float, *, poll_age: float | None = None) -> dict:
+        staged = self.stage_submission(engine, decision, yes_mid, poll_age=poll_age)
+        if staged is not None:
+            self.observe_book(engine, staged)
+        return decision
+
+    def stage_submission(self, engine, decision: dict, yes_mid: float, *, poll_age: float | None = None) -> dict | None:
+        """Record the decision and journal INTENDED before any execution-book read."""
         self._record(engine, decision, yes_mid)
         action = decision.get("action")
         if action == "WAIT" or action not in ("BUY_YES", "BUY_NO"):
-            return decision
+            return None
         if engine._open_pos is not None or self._asset_is_open(engine.spec.symbol):
             self.operational("open_position_blocks_entry", asset=engine.spec.symbol,
                              decision_id=decision.get("decision_id"))
-            return decision
+            return None
         try:
             entry, reason = production_entry(decision, yes_mid)
         except (TypeError, ValueError, KeyError, ZeroDivisionError) as exc:
             self.operational("entry_not_constructed", asset=engine.spec.symbol,
                              decision_id=decision.get("decision_id"), error=str(exc))
-            return decision
+            return None
         if entry is None:
             self.operational("entry_not_constructed", asset=engine.spec.symbol, reason=reason,
                              decision_id=decision.get("decision_id"))
-            return decision
+            return None
         if not isinstance(engine._window_id, int) or engine._window_id < 0 or not engine._ticker:
             self.operational("entry_identity_unavailable", asset=engine.spec.symbol,
                              decision_id=decision.get("decision_id"))
-            return decision
+            return None
         strategy = decision.get("strategy")
         if not isinstance(strategy, str) or not strategy.strip():
             self.operational("entry_strategy_unavailable", asset=engine.spec.symbol,
                              decision_id=decision.get("decision_id"))
-            return decision
+            return None
         frozen_ticker = engine._ticker
         frozen_window = engine._window_id
         ids_before = {
@@ -285,7 +307,7 @@ class ShadowEntry:
         except (JournalError, ValueError) as exc:
             self.operational("journal_intend_failed", asset=engine.spec.symbol,
                              decision_id=decision.get("decision_id"), error=str(exc))
-            return decision
+            return None
         if order["intended_order_id"] in ids_before or order.get("status") != "INTENDED" or order.get("execution"):
             self.operational(
                 "intention_already_consumed",
@@ -293,22 +315,38 @@ class ShadowEntry:
                 intended_order_id=order["intended_order_id"],
                 status=order.get("status"),
             )
-            return decision
-        self._observe_once(engine, order, frozen_ticker, frozen_window, poll_age)
-        return decision
+            return None
+        return {
+            "order": order,
+            "ticker": frozen_ticker,
+            "window_id": frozen_window,
+            "poll_age": poll_age,
+        }
 
-    def _observe_once(self, engine, order, ticker: str, window_id: int, poll_age) -> None:
-        order_id = order["intended_order_id"]
-        try:
-            book = self.market.fetch_execution_book(ticker)
-        except BookIdentityError as exc:
+    def note_book_failure(self, staged: dict, exc: Exception) -> None:
+        order_id = staged["order"]["intended_order_id"]
+        ticker = staged["ticker"]
+        if isinstance(exc, BookIdentityError):
             self.operational("execution_book_identity_mismatch", intended_order_id=order_id,
                              ticker=ticker, error=str(exc))
             return
-        except (BookReadError, Exception) as exc:
-            self.operational("execution_book_failed", intended_order_id=order_id,
-                             ticker=ticker, error=str(exc))
+        self.operational("execution_book_failed", intended_order_id=order_id,
+                         ticker=ticker, error=str(exc))
+
+    def observe_book(self, engine, staged: dict) -> None:
+        try:
+            book = self.market.fetch_execution_book(staged["ticker"])
+        except Exception as exc:
+            self.note_book_failure(staged, exc)
             return
+        self.apply_execution_book(engine, staged, book)
+
+    def apply_execution_book(self, engine, staged: dict, book) -> None:
+        order = staged["order"]
+        ticker = staged["ticker"]
+        window_id = staged["window_id"]
+        poll_age = staged["poll_age"]
+        order_id = order["intended_order_id"]
         request = order["request"]
         if request["ticker"] != ticker or request["window_id_ts"] != window_id:
             self.operational("execution_book_identity_mismatch", intended_order_id=order_id,

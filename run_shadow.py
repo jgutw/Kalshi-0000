@@ -99,14 +99,56 @@ def build_engines(market, sim):
         )
     for engine in engines.values():
         engine._all_engines = engines
+    return engines
+
+
+async def _read_market(market, method, *args):
+    """Run one synchronous Kalshi read off the event-loop thread.
+
+    The worker holds the client lock across signing and requests.get.
+    Engine and journal mutation happens after this returns, on the event loop.
+    """
+    def call():
+        lock = getattr(market, "_call_lock", None)
+        if lock is None:
+            return method(*args)
+        with lock:
+            return method(*args)
+
+    return await asyncio.to_thread(call)
+
+
+def _install_polled_market(engine, found) -> None:
+    if not found:
+        return
+    engine._market = found
+    engine._ticker = found.get("ticker", "")
+    engine._close_time_utc = found.get("close_time")
+
+
+async def _disable_unverified(market, engines) -> None:
     disabled = []
     for symbol, engine in engines.items():
-        if not market.verify_series(engine.spec.series_ticker):
+        ok = await _read_market(market, market.verify_series, engine.spec.series_ticker)
+        if not ok:
             disabled.append(symbol)
     for symbol in disabled:
         log.warning("[%s] series not verified — engine disabled", symbol)
         engines.pop(symbol, None)
-    return engines
+
+
+async def _consume_yes_mid(pipeline: ShadowEntry, engine, yes_mid: float) -> None:
+    _decision, staged = pipeline.evaluate(engine, yes_mid)
+    if staged is None:
+        return
+    try:
+        book = await _read_market(
+            pipeline.market, pipeline.market.fetch_execution_book, staged["ticker"],
+        )
+    except Exception as exc:
+        pipeline.note_book_failure(staged, exc)
+        return
+    pipeline.apply_execution_book(engine, staged, book)
 
 
 async def _price_loop(pipeline: ShadowEntry, engine: AssetEngine, telemetry: FeedTelemetry) -> None:
@@ -114,28 +156,29 @@ async def _price_loop(pipeline: ShadowEntry, engine: AssetEngine, telemetry: Fee
     heartbeat = 0.0
     while True:
         try:
-            pipeline.refresh_window(engine)
+            series = pipeline.refresh_window(engine)
+            if series is not None:
+                found = await _read_market(pipeline.market, pipeline.market.find_active_market, series)
+                pipeline.apply_active_market(engine, found)
             if engine._ticker:
-                yes_mid = pipeline.market.get_yes_mid(engine._ticker)
+                yes_mid = await _read_market(pipeline.market, pipeline.market.get_yes_mid, engine._ticker)
                 if yes_mid is not None:
                     streak = 0
-                    pipeline.on_yes_mid(engine, yes_mid)
+                    await _consume_yes_mid(pipeline, engine, yes_mid)
                 else:
                     streak += 1
                     if streak % 5 == 1:
-                        found = pipeline.market.find_active_market(engine.spec.series_ticker)
-                        if found:
-                            engine._market = found
-                            engine._ticker = found.get("ticker", "")
-                            engine._close_time_utc = found.get("close_time")
+                        found = await _read_market(
+                            pipeline.market, pipeline.market.find_active_market, engine.spec.series_ticker,
+                        )
+                        _install_polled_market(engine, found)
             else:
                 streak += 1
                 if streak % 5 == 1:
-                    found = pipeline.market.find_active_market(engine.spec.series_ticker)
-                    if found:
-                        engine._market = found
-                        engine._ticker = found.get("ticker", "")
-                        engine._close_time_utc = found.get("close_time")
+                    found = await _read_market(
+                        pipeline.market, pipeline.market.find_active_market, engine.spec.series_ticker,
+                    )
+                    _install_polled_market(engine, found)
             now = time.time()
             if now - heartbeat >= 30:
                 pipeline.operational(
@@ -171,6 +214,7 @@ async def run(args) -> None:
         pipeline.operational("startup", mode="recover" if args.recover else "new",
                              starting_balance=balance)
         engines = build_engines(pipeline.market, private_sim(balance))
+        await _disable_unverified(pipeline.market, engines)
         pipeline.restore_open_positions(engines)
         telemetry = FeedTelemetry()
         tasks = [asyncio.create_task(_price_loop(pipeline, engine, telemetry), name=f"price:{symbol}")
