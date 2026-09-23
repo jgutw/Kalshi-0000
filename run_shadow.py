@@ -156,6 +156,7 @@ async def _price_loop(pipeline: ShadowEntry, engine: AssetEngine, telemetry: Fee
     heartbeat = 0.0
     while True:
         try:
+            pipeline.settle_if_due(engine)
             series = pipeline.refresh_window(engine)
             if series is not None:
                 found = await _read_market(pipeline.market, pipeline.market.find_active_market, series)

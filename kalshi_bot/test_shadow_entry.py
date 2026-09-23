@@ -747,6 +747,7 @@ class EventLoopSchedulingTests(unittest.TestCase):
             market=SimpleNamespace(get_yes_mid=get_yes_mid, find_active_market=lambda series: None),
             refresh_window=lambda engine: None,
             apply_active_market=lambda engine, found: None,
+            settle_if_due=lambda engine: None,
             evaluate=lambda engine, yes: ({"action": "WAIT", "reason": "signal_warmup"}, None),
             operational=lambda *args, **kwargs: None,
         )
@@ -803,6 +804,7 @@ class EventLoopSchedulingTests(unittest.TestCase):
             ),
             refresh_window=lambda engine: "KXBTC15M",
             apply_active_market=apply_active_market,
+            settle_if_due=lambda engine: None,
             evaluate=lambda engine, yes: ({"action": "WAIT"}, None),
             operational=lambda *args, **kwargs: None,
         )

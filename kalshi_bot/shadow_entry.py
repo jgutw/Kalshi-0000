@@ -18,6 +18,7 @@ from .asset_engine import _floor_strike_from_market
 from .config import cfg
 from .shadow_journal import JournalError, strict_loads
 from .shadow_market import BookIdentityError
+from .shadow_settlement import SETTLEMENT_METHOD, window_close_ts
 from .sim_state import OpenPosition, SimState
 
 log = logging.getLogger("kalshi_bot.shadow_entry")
@@ -60,6 +61,13 @@ def entry_from_decision(decision: dict, yes_price: float, *, p_base_min: float,
         return None, "outside_entry_band"
     contracts = max(1, int(decision["size_usd"] / max(entry_price, 0.01)))
     return IntendedEntry(side, entry_price, contracts), None
+
+
+def _durable_strike(value):
+    """Fill-time spot strike, or None when the engine has no positive finite strike."""
+    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+        return None
+    return float(value)
 
 
 def production_entry(decision: dict, yes_price: float) -> tuple[IntendedEntry | None, str | None]:
@@ -247,7 +255,7 @@ class ShadowEntry:
                 contracts=int(position["quantity"]),
                 amount_usdc=float(position["entry_price"]) * int(position["quantity"]),
                 entered_at=time.time(),
-                price_to_beat=engine._price_to_beat,
+                price_to_beat=position.get("price_to_beat"),
                 order_id=position["position_id"],
                 decision_id=request["decision_id"],
             )
@@ -359,6 +367,7 @@ class ShadowEntry:
         try:
             payload = self.session.simulate_execution(
                 order_id, book, yes_mid_poll_age_secs=poll_age,
+                price_to_beat=_durable_strike(engine._price_to_beat),
             )
         except (JournalError, ValueError) as exc:
             self.operational("simulation_rejected", intended_order_id=order_id, error=str(exc))
@@ -374,8 +383,81 @@ class ShadowEntry:
                 contracts=int(result["filled_quantity"]),
                 amount_usdc=float(result["simulated_price"]) * int(result["filled_quantity"]),
                 entered_at=time.time(),
-                price_to_beat=engine._price_to_beat,
+                price_to_beat=payload.get("price_to_beat"),
                 order_id=str(payload.get("position_id") or ""),
                 decision_id=request["decision_id"],
                 decision=None,
             )
+
+    def settle_if_due(self, engine, now: float | None = None) -> None:
+        """Close one open position on the first valid spot at or after its window boundary.
+
+        Uses the strike stored with the fill. Does not read the engine's current
+        price_to_beat, which a window roll may already have replaced.
+        """
+        pos = engine._open_pos
+        if pos is None or not pos.order_id:
+            return
+        now = time.time() if now is None else now
+        position = self.session.journal.state["positions"].get(pos.order_id)
+        if position is None:
+            self._settlement_error(engine, pos, ValueError("Open position is not in the journal"))
+            return
+        if position["status"] == "CLOSED":
+            engine._open_pos = None
+            return
+        if position["status"] != "OPEN":
+            self._settlement_error(engine, pos, ValueError("Position is not open"))
+            return
+        if position.get("price_to_beat") is None:
+            self._settlement_error(engine, pos, ValueError("Open position has no durable price_to_beat"))
+            return
+        try:
+            close_ts = window_close_ts(position["request"]["window_id_ts"])
+        except (TypeError, ValueError) as exc:
+            self._settlement_error(engine, pos, exc)
+            return
+        if now < close_ts:
+            return
+        spot = getattr(engine.synthetic_spot, "spot_mid", None)
+        if type(spot) not in (int, float) or not math.isfinite(spot) or spot <= 0:
+            if not getattr(engine, "_settlement_wait_noted", False):
+                self.operational(
+                    "settlement_waiting",
+                    asset=engine.spec.symbol,
+                    position_id=pos.order_id,
+                    window_id_ts=pos.window_id,
+                )
+                engine._settlement_wait_noted = True
+            return
+        try:
+            closed = self.session.journal.settle_research(
+                pos.order_id, observed_spot=spot, observation_unix=now,
+            )
+        except (JournalError, ValueError) as exc:
+            self._settlement_error(engine, pos, exc)
+            return
+        engine._open_pos = None
+        engine._settlement_wait_noted = False
+        self.operational(
+            "shadow_position_closed",
+            asset=engine.spec.symbol,
+            position_id=pos.order_id,
+            window_id_ts=pos.window_id,
+            yes_settled=closed["yes_settled"],
+            side_payoff=closed["side_payoff"],
+            gross_pnl=closed["gross_pnl"],
+            settlement_method=SETTLEMENT_METHOD,
+        )
+
+    def _settlement_error(self, engine, pos, exc: Exception) -> None:
+        if getattr(engine, "_settlement_error_noted", False):
+            return
+        self.operational(
+            "settlement_error",
+            asset=engine.spec.symbol,
+            position_id=getattr(pos, "order_id", None),
+            window_id_ts=getattr(pos, "window_id", None),
+            error=str(exc),
+        )
+        engine._settlement_error_noted = True

@@ -10,6 +10,8 @@ import uuid
 from functools import wraps
 from threading import RLock
 
+from .shadow_settlement import RESEARCH_CLOSE_KEYS, research_close_payload
+
 
 class JournalError(RuntimeError):
     pass
@@ -60,6 +62,12 @@ def _price(value, nullable=False):
     if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
         raise ValueError("Finite probability price in [0, 1] required")
     return value
+
+
+def _spot(value):
+    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+        raise ValueError("Positive finite spot required")
+    return float(value)
 
 
 def intent_request(*, asset, window_id_ts, decision_id, strategy, ticker, side, count,
@@ -193,7 +201,8 @@ class ShadowJournal:
             state["receipts"][receipt] = deepcopy(p)
         elif kind == "SIMULATED_EXECUTION":
             from .shadow_execution import simulate, restore_observation, FULL
-            if type(p) is not dict or set(p) != {"execution_id", "intended_order_id", "position_id", "result"}:
+            sim_keys = {"execution_id", "intended_order_id", "position_id", "result"}
+            if type(p) is not dict or set(p) not in (sim_keys, sim_keys | {"price_to_beat"}):
                 raise ValueError("Invalid simulated execution payload")
             orders = [o for o in state["orders"].values() if o["intended_order_id"] == p["intended_order_id"]]
             if len(orders) != 1 or orders[0]["status"] != "INTENDED":
@@ -216,17 +225,35 @@ class ShadowJournal:
             if expected["disposition"] == FULL:
                 if position_id in state["positions"]:
                     raise ValueError("Duplicate position identity")
-                state["positions"][position_id] = dict(position_id=position_id,
+                opened = dict(position_id=position_id,
                     intended_order_id=order["intended_order_id"], idempotency_key=order["idempotency_key"],
                     request=deepcopy(order["request"]), execution_id=execution_id,
                     quantity=expected["filled_quantity"], entry_price=expected["simulated_price"],
                     opened_utc=event["timestamp_utc"], status="OPEN", close=None,
                     source="shadow_execution_v1")
+                if "price_to_beat" in p:
+                    opened["price_to_beat"] = _spot(p["price_to_beat"])
+                state["positions"][position_id] = opened
                 order["status"] = "FILLED"
                 order["position_id"] = position_id
             else:
                 order["status"] = "NOT_FILLED"
             order["execution"] = deepcopy(p)
+            state["receipts"][receipt] = deepcopy(p)
+        elif kind == "CLOSED" and set(p) == RESEARCH_CLOSE_KEYS:
+            receipt = "close:" + _text(p["close_id"])
+            if receipt in state["receipts"]:
+                raise ValueError("Duplicate close event")
+            position = state["positions"].get(p["position_id"])
+            if position is None or position["status"] != "OPEN":
+                raise ValueError("Close requires an open position")
+            expected = research_close_payload(
+                position, observed_spot=p["observed_spot"], observation_unix=p["observation_unix"],
+            )
+            if canonical(expected) != canonical(p):
+                raise ValueError("Research settlement does not match the open position")
+            position["status"] = "CLOSED"
+            position["close"] = dict(p, timestamp_utc=event["timestamp_utc"])
             state["receipts"][receipt] = deepcopy(p)
         elif kind == "CLOSED":
             if set(p) != {"close_id", "position_id", "reason", "outcome", "outcome_source"}:
@@ -349,8 +376,13 @@ class ShadowJournal:
 
     @_operation
     def simulate_execution(self, intended_order_id, book_snapshot, *,
-                           yes_mid_poll_age_secs=None, book_exchange_timestamp=None):
-        """One caller-supplied snapshot, no fetch. Duplicate execution always fails."""
+                           yes_mid_poll_age_secs=None, book_exchange_timestamp=None,
+                           price_to_beat=None):
+        """One caller-supplied snapshot, no fetch. Duplicate execution always fails.
+
+        price_to_beat is fill-time strike provenance. It is not part of the
+        execution-model hash, and older events omit it.
+        """
         from .shadow_execution import simulate
         self._check()
         _text(intended_order_id)
@@ -362,7 +394,29 @@ class ShadowJournal:
         execution_id, position_id = self._simulation_ids(result)
         payload = dict(execution_id=execution_id, intended_order_id=intended_order_id,
                        position_id=position_id, result=result)
+        if price_to_beat is not None:
+            payload["price_to_beat"] = _spot(price_to_beat)
         self._append("SIMULATED_EXECUTION", payload)
+        return deepcopy(payload)
+
+    @_operation
+    def settle_research(self, position_id, *, observed_spot, observation_unix):
+        """Append one research CLOSE, or return the identical close already stored."""
+        self._check()
+        position = self._state["positions"].get(position_id)
+        if position is None:
+            raise JournalError("Close requires an open position")
+        payload = research_close_payload(
+            position, observed_spot=observed_spot, observation_unix=observation_unix,
+        )
+        receipt = self._state["receipts"].get("close:" + payload["close_id"])
+        if receipt:
+            if canonical(receipt) != canonical(payload):
+                raise JournalError("Conflicting close retry")
+            return deepcopy(receipt)
+        if position["status"] != "OPEN":
+            raise JournalError("Close requires an open position")
+        self._append("CLOSED", payload)
         return deepcopy(payload)
 
     @_operation
