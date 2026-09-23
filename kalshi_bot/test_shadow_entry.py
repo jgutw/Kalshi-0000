@@ -1,6 +1,7 @@
 """Offline Shadow entry pipeline. No live sockets and no production artifacts."""
 import ast
 import base64
+import time
 import inspect
 import subprocess
 import sys
@@ -23,7 +24,8 @@ from kalshi_bot.shadow_entry import (
     production_entry, record_starting_balance,
 )
 from kalshi_bot.shadow_execution import FULL, NOT_MARKETABLE
-from kalshi_bot.shadow_feeds import public_feed_coros
+from kalshi_bot.data.synthetic_spot import SyntheticSpotEstimator
+from kalshi_bot.shadow_feeds import FeedTelemetry, public_feed_coros, warmup_snapshot
 from kalshi_bot.signal_engine import AssetSignalEngine
 from kalshi_bot.shadow_journal import strict_loads
 from kalshi_bot.shadow_market import BookIdentityError, BookReadError, ReadOnlyKalshi, sign_get
@@ -36,6 +38,57 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def _forbid(*args, **kwargs):
     raise AssertionError("production state write")
+
+
+def _idle_coro():
+    async def _inner():
+        return None
+    return _inner()
+
+
+def _shadow_callbacks(engine, telemetry):
+    """Capture Shadow feed closures without opening a socket."""
+    from kalshi_bot import shadow_feeds
+    captured = {}
+
+    def spy_coinbase(symbol, product_id, on_trade=None, on_book=None, on_mid=None):
+        captured["coinbase"] = (on_trade, on_book, on_mid)
+        return _idle_coro()
+
+    def spy_binance(symbol, binance_symbol, url, on_trade, on_book, on_spot, **kwargs):
+        captured["binance"] = (on_trade, on_book, on_spot)
+        return _idle_coro()
+
+    def spy_okx(symbol, inst_id, url, on_trade, on_book, on_spot, **kwargs):
+        captured["okx"] = (on_trade, on_book, on_spot)
+        return _idle_coro()
+
+    def spy_kraken(symbol, pair, on_mid=None):
+        captured["kraken"] = on_mid
+        return _idle_coro()
+
+    def spy_gemini(symbol, pair, on_mid=None):
+        captured["gemini"] = on_mid
+        return _idle_coro()
+
+    originals = {
+        "run_coinbase_microstructure": shadow_feeds.run_coinbase_microstructure,
+        "run_binance_feed": shadow_feeds.run_binance_feed,
+        "run_okx_feed": shadow_feeds.run_okx_feed,
+        "run_kraken": shadow_feeds.run_kraken,
+        "run_gemini": shadow_feeds.run_gemini,
+    }
+    shadow_feeds.run_coinbase_microstructure = spy_coinbase
+    shadow_feeds.run_binance_feed = spy_binance
+    shadow_feeds.run_okx_feed = spy_okx
+    shadow_feeds.run_kraken = spy_kraken
+    shadow_feeds.run_gemini = spy_gemini
+    try:
+        pairs = public_feed_coros({"BTC": engine}, telemetry)
+    finally:
+        for name, original in originals.items():
+            setattr(shadow_feeds, name, original)
+    return captured, [coro for _, coro in pairs]
 
 
 def _decision(**overrides):
@@ -532,6 +585,123 @@ class BoundaryTests(unittest.TestCase):
         finally:
             for _, coro in pairs:
                 coro.close()
+
+    def test_trade_callbacks_count_once_and_reach_the_real_engine(self):
+        signal = AssetSignalEngine("btc")
+        engine = SimpleNamespace(
+            signal=signal,
+            synthetic_spot=SyntheticSpotEstimator("btc"),
+            spec=SimpleNamespace(symbol="BTC"),
+        )
+        telemetry = FeedTelemetry()
+        captured, pairs = _shadow_callbacks(engine, telemetry)
+        try:
+            captured["coinbase"][0](50000.0, 0.01, "BUY")
+            captured["binance"][0](50001.0, 0.02, False)
+            captured["okx"][0](50002.0, 0.03, "buy")
+        finally:
+            for coro in pairs:
+                coro.close()
+        self.assertEqual(telemetry.count("BTC", "coinbase_trades"), 1)
+        self.assertEqual(telemetry.count("BTC", "binance_trades"), 1)
+        self.assertEqual(telemetry.count("BTC", "okx_trades"), 1)
+        self.assertEqual(len(signal.prices), 3)
+        self.assertEqual(len(signal.trades), 3)
+        self.assertEqual([trade["p"] for trade in signal.trades], [50000.0, 50001.0, 50002.0])
+
+    def test_book_and_mid_callbacks_count_without_changing_forwarded_values(self):
+        signal = AssetSignalEngine("btc")
+        forwarded = []
+        engine = SimpleNamespace(
+            signal=signal,
+            synthetic_spot=SimpleNamespace(
+                update=lambda source, price, ts=None: forwarded.append((source, price, ts)),
+            ),
+            spec=SimpleNamespace(symbol="BTC"),
+        )
+        books = []
+        signal.update_book_binance = lambda bids, asks: books.append(("binance", bids, asks))
+        signal.update_book_okx = lambda bids, asks: books.append(("okx", bids, asks))
+        telemetry = FeedTelemetry()
+        captured, pairs = _shadow_callbacks(engine, telemetry)
+        try:
+            coinbase_bids = [[100.0, 1.5], [99.0, 0.0]]
+            coinbase_asks = [[101.0, 2.0]]
+            bid_copy = [row[:] for row in coinbase_bids]
+            captured["coinbase"][1](coinbase_bids, coinbase_asks)
+            captured["coinbase"][2](100.5)
+            binance_bids = [["10.0", "1.0"]]
+            binance_asks = [["11.0", "2.0"]]
+            captured["binance"][1](binance_bids, binance_asks)
+            captured["binance"][2]("binance", 10.5)
+            okx_bids = [["20.0", "1.0", "0"]]
+            okx_asks = [["21.0", "1.0", "0"]]
+            captured["okx"][1](okx_bids, okx_asks)
+            captured["okx"][2]("okx", 20.5)
+            captured["kraken"](30.5)
+            captured["gemini"](40.5)
+        finally:
+            for coro in pairs:
+                coro.close()
+        self.assertEqual(coinbase_bids, bid_copy)
+        self.assertEqual(signal.book_bids_cb, {100.0: 1.5})
+        self.assertEqual(signal.book_asks_cb, {101.0: 2.0})
+        self.assertIs(books[0][1], binance_bids)
+        self.assertIs(books[0][2], binance_asks)
+        self.assertIs(books[1][1], okx_bids)
+        self.assertIs(books[1][2], okx_asks)
+        self.assertEqual(forwarded, [
+            ("coinbase", 100.5, None),
+            ("coinbase", 100.5, None),
+            ("binance", 10.5, None),
+            ("okx", 20.5, None),
+            ("kraken", 30.5, None),
+            ("gemini", 40.5, None),
+        ])
+        self.assertEqual(telemetry.count("BTC", "coinbase_books"), 1)
+        self.assertEqual(telemetry.count("BTC", "coinbase_mids"), 1)
+        self.assertEqual(telemetry.count("BTC", "binance_books"), 1)
+        self.assertEqual(telemetry.count("BTC", "binance_mids"), 1)
+        self.assertEqual(telemetry.count("BTC", "okx_books"), 1)
+        self.assertEqual(telemetry.count("BTC", "okx_mids"), 1)
+        self.assertEqual(telemetry.count("BTC", "kraken_mids"), 1)
+        self.assertEqual(telemetry.count("BTC", "gemini_mids"), 1)
+        self.assertEqual(len(signal.prices), 0)
+        self.assertFalse(signal.is_ready())
+
+    def test_warmup_snapshot_matches_engine_and_stays_out_of_decisions(self):
+        signal = AssetSignalEngine("btc")
+        spot = SyntheticSpotEstimator("btc")
+        engine = SimpleNamespace(signal=signal, synthetic_spot=spot, spec=SimpleNamespace(symbol="BTC"))
+        telemetry = FeedTelemetry()
+        before = warmup_snapshot(engine, telemetry, now=1_000.0)
+        self.assertEqual(before["prices"], 0)
+        self.assertEqual(before["trades"], 0)
+        self.assertFalse(before["is_ready"])
+        self.assertIsNone(before["trade_age_secs"])
+        self.assertIsNone(before["spot_mid"])
+        self.assertEqual(before["is_ready"], signal.is_ready())
+        for i in range(20):
+            signal.update_trade_coinbase(100.0 + i, 0.01, "BUY")
+        now = time.time()
+        spot.update("coinbase", 110.0, ts=now - 2.0)
+        after = warmup_snapshot(engine, telemetry, now=now)
+        self.assertEqual(after["prices"], len(signal.prices))
+        self.assertEqual(after["trades"], len(signal.trades))
+        self.assertGreaterEqual(after["prices"], 20)
+        self.assertGreaterEqual(after["trades"], 5)
+        self.assertEqual(after["is_ready"], signal.is_ready())
+        self.assertTrue(after["is_ready"])
+        self.assertEqual(after["spot_mid"], 110.0)
+        self.assertEqual(after["spot_sources"], 1)
+        self.assertAlmostEqual(after["spot_staleness_secs"], spot.staleness, places=2)
+        self.assertGreaterEqual(after["trade_age_secs"], 0.0)
+        self.assertLess(after["trade_age_secs"], 5.0)
+        counted = (len(signal.prices), len(signal.trades), signal.is_ready())
+        for _ in range(5):
+            telemetry.note("BTC", "coinbase_trades")
+        self.assertEqual((len(signal.prices), len(signal.trades), signal.is_ready()), counted)
+        self.assertEqual(warmup_snapshot(engine, telemetry, now=1_000.0)["coinbase_trades"], 5)
 
     def test_private_sim_does_not_load_production_state(self):
         original = SimState.load

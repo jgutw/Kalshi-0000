@@ -18,7 +18,7 @@ from kalshi_bot.shadow import ShadowSession
 from kalshi_bot.shadow_entry import (
     ShadowEntry, load_starting_balance, private_sim, record_starting_balance,
 )
-from kalshi_bot.shadow_feeds import public_feed_coros
+from kalshi_bot.shadow_feeds import FeedTelemetry, public_feed_coros, warmup_snapshot
 from kalshi_bot.shadow_market import ReadOnlyKalshi
 
 log = logging.getLogger("kalshi_bot.shadow")
@@ -109,7 +109,7 @@ def build_engines(market, sim):
     return engines
 
 
-async def _price_loop(pipeline: ShadowEntry, engine: AssetEngine) -> None:
+async def _price_loop(pipeline: ShadowEntry, engine: AssetEngine, telemetry: FeedTelemetry) -> None:
     streak = 0
     heartbeat = 0.0
     while True:
@@ -141,6 +141,7 @@ async def _price_loop(pipeline: ShadowEntry, engine: AssetEngine) -> None:
                 pipeline.operational(
                     "heartbeat", asset=engine.spec.symbol, ticks=engine._total_ticks,
                     ticker=engine._ticker or None, window_id_ts=engine._window_id,
+                    **warmup_snapshot(engine, telemetry, now),
                 )
                 heartbeat = now
         except Exception as exc:
@@ -171,9 +172,10 @@ async def run(args) -> None:
                              starting_balance=balance)
         engines = build_engines(pipeline.market, private_sim(balance))
         pipeline.restore_open_positions(engines)
-        tasks = [asyncio.create_task(_price_loop(pipeline, engine), name=f"price:{symbol}")
+        telemetry = FeedTelemetry()
+        tasks = [asyncio.create_task(_price_loop(pipeline, engine, telemetry), name=f"price:{symbol}")
                  for symbol, engine in engines.items()]
-        for name, coro in public_feed_coros(engines):
+        for name, coro in public_feed_coros(engines, telemetry):
             tasks.append(asyncio.create_task(_watch_feed(pipeline, name, coro), name=name))
         await asyncio.gather(*tasks)
     except Exception as exc:
