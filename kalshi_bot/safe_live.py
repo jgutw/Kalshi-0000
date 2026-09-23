@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from .shadow import reject_live_start_in_shadow
+
 from .config import cfg
 from .kalshi_client import KalshiClient
 from .runtime_control import PROFILE_PRESETS, prepare_for_new_round, trading_bot_running
@@ -100,6 +102,7 @@ def start_live_safe(
       - available < LIVE_MIN_AVAILABLE_USD
       - open Kalshi positions exist (unless force_with_opens)
     """
+    reject_live_start_in_shadow()
     rounds = _rounds()
     profile = rounds.resolve_profile(profile)
     if profile not in PROFILE_PRESETS:
