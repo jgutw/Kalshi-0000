@@ -24,6 +24,7 @@ from kalshi_bot.shadow_entry import (
 )
 from kalshi_bot.shadow_execution import FULL, NOT_MARKETABLE
 from kalshi_bot.shadow_feeds import public_feed_coros
+from kalshi_bot.signal_engine import AssetSignalEngine
 from kalshi_bot.shadow_journal import strict_loads
 from kalshi_bot.shadow_market import BookIdentityError, BookReadError, ReadOnlyKalshi, sign_get
 from kalshi_bot.sim_state import SimState
@@ -476,6 +477,61 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(btc_names, [
             "BTC:coinbase", "BTC:binance", "BTC:okx", "BTC:kraken", "BTC:gemini",
         ])
+
+    def test_coinbase_book_does_not_call_missing_method_and_trades_reach_ready(self):
+        from kalshi_bot import shadow_feeds
+        signal = AssetSignalEngine("btc")
+        spots = []
+        engine = SimpleNamespace(
+            signal=signal,
+            synthetic_spot=SimpleNamespace(update=lambda source, mid: spots.append((source, mid))),
+        )
+
+        def reject_missing(*_args, **_kwargs):
+            raise AssertionError("update_book_coinbase")
+
+        signal.update_book_coinbase = reject_missing
+        captured = {}
+
+        def spy(symbol, product_id, on_trade=None, on_book=None, on_mid=None):
+            captured["on_trade"] = on_trade
+            captured["on_book"] = on_book
+            async def idle():
+                return None
+            return idle()
+
+        original = shadow_feeds.run_coinbase_microstructure
+        shadow_feeds.run_coinbase_microstructure = spy
+        try:
+            pairs = public_feed_coros({"BTC": engine})
+        finally:
+            shadow_feeds.run_coinbase_microstructure = original
+        try:
+            bids = [[100.0, 1.5], [99.0, 0.0]]
+            asks = [[101.0, 2.0], [102.0, 0.25]]
+            captured["on_book"](bids, asks)
+            captured["on_book"](bids, asks)
+            self.assertEqual(signal.book_bids_cb, {100.0: 1.5})
+            self.assertEqual(signal.book_asks_cb, {101.0: 2.0, 102.0: 0.25})
+            self.assertEqual(spots, [("coinbase", 100.5), ("coinbase", 100.5)])
+            self.assertFalse(signal.is_ready())
+            seen = []
+            original_trade = signal.update_trade_coinbase
+
+            def wrapped(price, qty, side):
+                seen.append((price, qty, side))
+                return original_trade(price, qty, side)
+
+            signal.update_trade_coinbase = wrapped
+            for i in range(20):
+                captured["on_trade"](50000.0 + i, 0.01, "BUY")
+            self.assertEqual(len(seen), 20)
+            self.assertGreaterEqual(len(signal.prices), 20)
+            self.assertGreaterEqual(len(signal.trades), 5)
+            self.assertTrue(signal.is_ready())
+        finally:
+            for _, coro in pairs:
+                coro.close()
 
     def test_private_sim_does_not_load_production_state(self):
         original = SimState.load

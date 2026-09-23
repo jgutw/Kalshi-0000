@@ -15,6 +15,24 @@ from .data.okx_feed import OKX_WS, run_okx_feed
 log = logging.getLogger("kalshi_bot.shadow_feeds")
 
 
+def _apply_coinbase_book(signal, engine, bids, asks) -> None:
+    """Store a Coinbase book the way Binance stores its book, then refresh spot.
+
+    Shadow does not call update_book_coinbase. That method is not implemented,
+    and the exception would recycle the Coinbase trade socket.
+    """
+    signal.book_bids_cb = {float(price): float(qty) for price, qty in bids if float(qty) > 0}
+    signal.book_asks_cb = {float(price): float(qty) for price, qty in asks if float(qty) > 0}
+    if bids and asks:
+        try:
+            best_bid = max(float(level[0]) for level in bids if len(level) >= 1 and float(level[0]) > 0)
+            best_ask = min(float(level[0]) for level in asks if len(level) >= 1 and float(level[0]) > 0)
+            if best_bid > 0 and best_ask > 0:
+                engine.synthetic_spot.update("coinbase", (best_bid + best_ask) / 2)
+        except (ValueError, IndexError):
+            pass
+
+
 def public_feed_coros(engines: dict):
     """(name, coroutine) per production venue feed. Unmapped Kraken/Gemini assets are skipped."""
     coros = []
@@ -28,15 +46,7 @@ def public_feed_coros(engines: dict):
             signal.update_trade_coinbase(price, size, side)
 
         def on_book(bids, asks, engine=engine, signal=signal):
-            signal.update_book_coinbase(bids, asks)
-            if bids and asks:
-                try:
-                    best_bid = max(float(level[0]) for level in bids if len(level) >= 1 and float(level[0]) > 0)
-                    best_ask = min(float(level[0]) for level in asks if len(level) >= 1 and float(level[0]) > 0)
-                    if best_bid > 0 and best_ask > 0:
-                        engine.synthetic_spot.update("coinbase", (best_bid + best_ask) / 2)
-                except (ValueError, IndexError):
-                    pass
+            _apply_coinbase_book(signal, engine, bids, asks)
 
         def on_mid(mid, engine=engine):
             engine.synthetic_spot.update("coinbase", mid)
