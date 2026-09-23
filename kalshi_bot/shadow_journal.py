@@ -1,4 +1,4 @@
-"""Single-writer, append-only Shadow lifecycle journal. No execution model or I/O to exchanges."""
+"""Single-writer Shadow lifecycle journal with replay-validated counterfactual executions."""
 from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
@@ -191,6 +191,43 @@ class ShadowJournal:
                 order["position_id"] = pos_id
             order["execution"] = deepcopy(p)
             state["receipts"][receipt] = deepcopy(p)
+        elif kind == "SIMULATED_EXECUTION":
+            from .shadow_execution import simulate, restore_observation, FULL
+            if type(p) is not dict or set(p) != {"execution_id", "intended_order_id", "position_id", "result"}:
+                raise ValueError("Invalid simulated execution payload")
+            orders = [o for o in state["orders"].values() if o["intended_order_id"] == p["intended_order_id"]]
+            if len(orders) != 1 or orders[0]["status"] != "INTENDED":
+                raise ValueError("Simulated execution requires one pending intention; duplicates forbidden")
+            order = orders[0]
+            result = p["result"]
+            if type(result) is not dict:
+                raise ValueError("Invalid simulated result")
+            expected = simulate(order, restore_observation(result["observation"]),
+                                yes_mid_poll_age_secs=result["yes_mid_poll_age_secs"],
+                                book_exchange_timestamp=result["book_exchange_timestamp"])
+            if canonical(result) != canonical(expected):
+                raise ValueError("Simulated result does not match immutable observation/model")
+            execution_id, position_id = self._simulation_ids(expected)
+            if p["execution_id"] != execution_id or p["position_id"] != position_id:
+                raise ValueError("Noncanonical simulated execution/position identity")
+            receipt = "execution:" + execution_id
+            if receipt in state["receipts"]:
+                raise ValueError("Duplicate execution identity")
+            if expected["disposition"] == FULL:
+                if position_id in state["positions"]:
+                    raise ValueError("Duplicate position identity")
+                state["positions"][position_id] = dict(position_id=position_id,
+                    intended_order_id=order["intended_order_id"], idempotency_key=order["idempotency_key"],
+                    request=deepcopy(order["request"]), execution_id=execution_id,
+                    quantity=expected["filled_quantity"], entry_price=expected["simulated_price"],
+                    opened_utc=event["timestamp_utc"], status="OPEN", close=None,
+                    source="shadow_execution_v1")
+                order["status"] = "FILLED"
+                order["position_id"] = position_id
+            else:
+                order["status"] = "NOT_FILLED"
+            order["execution"] = deepcopy(p)
+            state["receipts"][receipt] = deepcopy(p)
         elif kind == "CLOSED":
             if set(p) != {"close_id", "position_id", "reason", "outcome", "outcome_source"}:
                 raise ValueError("Invalid close payload")
@@ -302,6 +339,31 @@ class ShadowJournal:
             return deepcopy(receipt)
         self._append("EXECUTION", p)
         return deepcopy(p)
+
+    @staticmethod
+    def _simulation_ids(result):
+        digest = hashlib.sha256(canonical(result).encode("utf-8")).hexdigest()
+        execution_id = "shadow-simulation-v1:" + digest
+        position_id = "shadow-position-v1:" + digest if result["filled_quantity"] else None
+        return execution_id, position_id
+
+    @_operation
+    def simulate_execution(self, intended_order_id, book_snapshot, *,
+                           yes_mid_poll_age_secs=None, book_exchange_timestamp=None):
+        """One caller-supplied snapshot, no fetch. Duplicate execution always fails."""
+        from .shadow_execution import simulate
+        self._check()
+        _text(intended_order_id)
+        orders = [o for o in self._state["orders"].values() if o["intended_order_id"] == intended_order_id]
+        if len(orders) != 1 or orders[0]["status"] != "INTENDED":
+            raise JournalError("Simulated execution requires one pending intention; duplicates forbidden")
+        result = simulate(orders[0], book_snapshot, yes_mid_poll_age_secs=yes_mid_poll_age_secs,
+                          book_exchange_timestamp=book_exchange_timestamp)
+        execution_id, position_id = self._simulation_ids(result)
+        payload = dict(execution_id=execution_id, intended_order_id=intended_order_id,
+                       position_id=position_id, result=result)
+        self._append("SIMULATED_EXECUTION", payload)
+        return deepcopy(payload)
 
     @_operation
     def close_position(self, *, close_id, position_id, reason, outcome=None, outcome_source=None):

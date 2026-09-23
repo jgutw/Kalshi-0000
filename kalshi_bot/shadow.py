@@ -128,6 +128,13 @@ class ShadowSession:
     def close(self):
         self.journal.close()
 
+    def simulate_execution(self, intended_order_id, book_snapshot, *,
+                           yes_mid_poll_age_secs=None, book_exchange_timestamp=None):
+        """Durably simulate one explicit book observation; never fetch market data."""
+        return self.journal.simulate_execution(intended_order_id, book_snapshot,
+                    yes_mid_poll_age_secs=yes_mid_poll_age_secs,
+                    book_exchange_timestamp=book_exchange_timestamp)
+
     def __enter__(self):
         return self
 
