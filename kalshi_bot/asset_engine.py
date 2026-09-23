@@ -127,6 +127,8 @@ class AssetEngine:
         recorder: Optional["EventRecorder"] = None,
         on_window_close: Optional[Callable[[str, str, float, float, str, int, float], None]] = None,
         research_store: Optional["ResearchForecastStore"] = None,
+        *,
+        entries_paused_provider: Optional[Callable[[], bool]] = None,
     ):
         self.spec   = spec
         self.kalshi = kalshi
@@ -134,6 +136,7 @@ class AssetEngine:
         self.recorder = recorder
         self._on_window_close = on_window_close
         self.research_store = research_store
+        self._entries_paused_provider = entries_paused_provider
 
         self.signal       = AssetSignalEngine(spec.symbol)
         self.tracker      = LogitPriceTracker()
@@ -674,7 +677,9 @@ class AssetEngine:
         self._research_tf_log_fields = None
         # Telegram / dashboard pause — block new entries only
         try:
-            from .runtime_control import entries_paused
+            entries_paused = self._entries_paused_provider
+            if entries_paused is None:
+                from .runtime_control import entries_paused
             if entries_paused():
                 return self._wait("telegram_paused", yes_price_raw)
         except Exception:
