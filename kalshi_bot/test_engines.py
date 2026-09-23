@@ -42,7 +42,8 @@ print("\n=== Kalshi Multi-Asset Bot - Engine Tests ===\n")
 # ─── 1. Config imports ────────────────────────────────────────────────────────
 print("[1] Config")
 try:
-    from kalshi_bot.config import cfg, api_cfg, ASSETS
+    from kalshi_bot.api_config import api_cfg
+    from kalshi_bot.config import cfg, ASSETS
     check("Config import",          True)
     check("WINDOW_SECS = 900",      cfg.WINDOW_SECS == 900, f"got {cfg.WINDOW_SECS}")
     check("HAWKES_DECAY < 0.1",     cfg.HAWKES_DECAY < 0.1, f"got {cfg.HAWKES_DECAY}")

@@ -38,7 +38,8 @@ from typing import Dict, List, Optional
 
 import websockets
 
-from .config import cfg, api_cfg, ASSETS, AssetSpec, all_asset_symbols
+from .api_config import api_cfg
+from .config import cfg, ASSETS, AssetSpec, all_asset_symbols
 from .data.kraken_feed import SYMBOL_TO_PAIR as KRAKEN_PAIRS
 from .data.gemini_feed import SYMBOL_TO_PAIR as GEMINI_PAIRS
 from .kalshi_client import KalshiClient

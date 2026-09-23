@@ -29,9 +29,9 @@ import numpy as np
 from .config import cfg, AssetSpec, BLACKOUT_WINDOWS, BLACKOUT_HALF_WIDTH_SECS
 
 if TYPE_CHECKING:
+    from .kalshi_client import KalshiClient
     from .recorder import EventRecorder
     from .research_store import ResearchForecastStore
-from .kalshi_client import KalshiClient
 from .lag_tracker import KalshiLagTracker
 from .prob_model import SECONDS_PER_YEAR
 from .features.threshold_features import compute_threshold_features

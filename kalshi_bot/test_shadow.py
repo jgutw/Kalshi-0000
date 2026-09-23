@@ -90,11 +90,12 @@ class ShadowTests(unittest.TestCase):
         # Real client method, inert config; constructing no authenticated client.
         config = types.ModuleType("kalshi_bot.config")
         config.cfg = types.SimpleNamespace(DRY_RUN=True)
-        config.api_cfg = types.SimpleNamespace()
+        api_config = types.ModuleType("kalshi_bot.api_config")
+        api_config.api_cfg = types.SimpleNamespace()
         name = "kalshi_bot._shadow_client_regression"
         spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name("kalshi_client.py"))
         module = importlib.util.module_from_spec(spec)
-        with patch.dict("sys.modules", {"kalshi_bot.config": config, name: module}):
+        with patch.dict("sys.modules", {"kalshi_bot.config": config, "kalshi_bot.api_config": api_config, name: module}):
             spec.loader.exec_module(module)
             client = object.__new__(module.KalshiClient)
             client._post = Mock(side_effect=AssertionError("network write"))

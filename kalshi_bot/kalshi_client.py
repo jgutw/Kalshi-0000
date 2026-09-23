@@ -38,7 +38,8 @@ try:
 except ImportError:
     _HAS_CRYPTO = False
 
-from .config import api_cfg, cfg
+from .api_config import api_cfg
+from .config import cfg
 
 log = logging.getLogger("kalshi_client")
 
