@@ -37,6 +37,22 @@ log = logging.getLogger("kalshi_bot.telegram.handlers")
 
 SendFn = Callable[[str], None]
 
+# Remote commands that start trading, move cash, or raise exposure.
+# Status, pause, and stop stay available. Local CLI start is unchanged.
+_EXPOSURE_COMMANDS = {
+    "/resume_live", "/start_live", "/safe_live",
+    "/go", "/start_round", "/new", "/new_round",
+    "/take_cash", "/vault_auto", "/vault_set",
+    "/resume",
+    "/set_max_pos", "/set_min_trade", "/set_kelly", "/set_portfolio_cap",
+    "/set_consec_losses", "/set_daily_loss", "/set_max_drawdown",
+    "/profile",
+}
+_EXPOSURE_REFUSAL = (
+    "Refused. This Telegram release can report status and pause or stop the bot. "
+    "It cannot start trading, move cash, or raise exposure."
+)
+
 
 def _parse_pct(raw: str) -> float:
     """Accept 0.08 or 8 (percent)."""
@@ -105,6 +121,9 @@ def handle_command(text: str, send: SendFn) -> None:
     parts = text.split()
     cmd = parts[0].split("@")[0].lower()
     args = parts[1:]
+    if cmd in _EXPOSURE_COMMANDS or (cmd == "/start" and args):
+        send(_EXPOSURE_REFUSAL)
+        return
 
     try:
         if cmd in ("/start", "/help"):

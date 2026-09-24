@@ -683,7 +683,7 @@ class AssetEngine:
             if entries_paused():
                 return self._wait("telegram_paused", yes_price_raw)
         except Exception:
-            pass
+            return self._wait("telegram_paused", yes_price_raw)
 
         # Circuit breaker
         halted, halt_reason = self.sim.is_halted(self.spec.symbol)

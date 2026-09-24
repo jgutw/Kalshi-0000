@@ -40,22 +40,22 @@ class PauseProviderTests(unittest.TestCase):
             self.assertEqual(engine.make_decision(.5)['reason'], 'signal_warmup')
         provider.assert_called_once_with()
 
-    def test_default_provider_exception_fails_open(self):
+    def test_default_provider_exception_blocks_new_risk(self):
         provider = Mock(side_effect=OSError('synthetic unreadable state'))
         engine = self.engine()
         with self.runtime(provider):
-            self.assertEqual(engine.make_decision(.5)['reason'], 'signal_warmup')
+            self.assertEqual(engine.make_decision(.5)['reason'], 'telegram_paused')
         provider.assert_called_once_with()
 
-    def test_default_import_exception_fails_open(self):
+    def test_default_import_exception_blocks_new_risk(self):
         original = builtins.__import__
         def guarded(name, *args, **kwargs):
-            if name == 'runtime_control':
+            if name in ('runtime_control', 'kalshi_bot.runtime_control'):
                 raise ImportError('synthetic import failure')
             return original(name, *args, **kwargs)
         engine = self.engine()
         with patch('builtins.__import__', side_effect=guarded):
-            self.assertEqual(engine.make_decision(.5)['reason'], 'signal_warmup')
+            self.assertEqual(engine.make_decision(.5)['reason'], 'telegram_paused')
 
     def test_injected_false_no_runtime_import_stat_or_read(self):
         provider = Mock(return_value=False)
@@ -94,12 +94,12 @@ class PauseProviderTests(unittest.TestCase):
         provider.assert_called_once_with()
         production.assert_not_called()
 
-    def test_injected_exception_fails_open(self):
+    def test_injected_exception_blocks_new_risk(self):
         provider = Mock(side_effect=RuntimeError('synthetic failure'))
         production = Mock(side_effect=AssertionError('no default fallback'))
         engine = self.engine(entries_paused_provider=provider)
         with self.runtime(production):
-            self.assertEqual(engine.make_decision(.5)['reason'], 'signal_warmup')
+            self.assertEqual(engine.make_decision(.5)['reason'], 'telegram_paused')
         provider.assert_called_once_with()
         production.assert_not_called()
 

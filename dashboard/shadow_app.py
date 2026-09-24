@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from dashboard.environments import enter_shadow, sizing_basis_label
 from kalshi_bot.shadow_report import INTEGRITY_FAILED, SessionPathError, analyze, resolve_session
 
 
@@ -73,10 +74,16 @@ def _age(then, now):
     return f"{secs}s"
 
 
-def _page() -> None:
+def _page(*, embedded: bool = False) -> None:
     args = _args()
-    st.set_page_config(page_title="Shadow dashboard", layout="wide")
+    if not embedded:
+        st.set_page_config(page_title="Shadow dashboard", layout="wide")
+    for key in list(st.session_state.keys()):
+        if key not in enter_shadow(dict(st.session_state)):
+            del st.session_state[key]
+    st.markdown("**SHADOW — NO CAPITAL**")
     st.title("Shadow")
+    st.caption("Simulated execution · research settlement · Shadow portfolio · read-only")
     root = st.sidebar.text_input("Root", args.root)
     session = st.sidebar.text_input("Session", args.session)
     if st.sidebar.button("Refresh"):
@@ -124,6 +131,9 @@ def _health(report) -> None:
     cols[1].metric("Heartbeat age", _age(report["last_heartbeat_utc"], report["now_utc"]))
     cols[2].metric("Runtime", _age(report["startup_utc"], report["shutdown_utc"] or report["now_utc"]))
     cols[3].metric("Loaded SHA", sha[:12] or "—")
+    feeds = equity.get("equity_feeds_sizing") if equity else None
+    basis = sizing_basis_label(feeds)
+    st.markdown(f"**{basis or 'Sizing basis withheld'}**")
     st.markdown(f"Session `{session_id}`")
     st.caption(
         f"Full SHA {sha or '—'} · startup {_stamp(report['startup_utc'])} · "
@@ -267,4 +277,5 @@ def main() -> None:
     page.run()
 
 
-main()
+if __name__ == "__main__":
+    main()
