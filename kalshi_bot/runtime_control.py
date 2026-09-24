@@ -345,6 +345,20 @@ def prepare_for_new_round(source: str = "start_round") -> None:
     save_runtime(rt)
 
 
+def setting_bounds(action: str, *, live: bool) -> tuple[float, float]:
+    """Canonical numeric limits. Live consecutive-loss ceiling is 3."""
+    if action == "set_consec_losses":
+        return (2, 3 if live else 8)
+    return {
+        "set_max_pos": (0.01, 0.50),
+        "set_min_trade": (0.5, 1000.0),
+        "set_kelly": (0.05, 1.0),
+        "set_portfolio_cap": (0.05, 1.0),
+        "set_daily_loss": (0.05, 0.50),
+        "set_max_drawdown": (0.05, 0.60),
+    }[action]
+
+
 def enqueue_bot_command(action: str, **payload: Any) -> None:
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     cmd = {"ts": _now(), "action": action, **payload}
@@ -563,8 +577,8 @@ def process_bot_commands(
                 # legacy 8 is refused so this can't be used to disable the
                 # breaker while a round is bleeding.
                 val = int(float(cmd["value"]))
-                hi = 8 if cfg.DRY_RUN else int(getattr(cfg, "LIVE_MAX_CONSEC_LOSSES", 3))
-                if not 2 <= val <= hi:
+                _lo, hi = setting_bounds(action, live=not cfg.DRY_RUN)
+                if not _lo <= val <= hi:
                     results.append(f"set_consec_losses rejected: {val} (allowed 2-{hi})")
                 else:
                     cfg.MAX_CONSEC_LOSSES = val

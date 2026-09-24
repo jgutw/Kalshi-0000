@@ -108,121 +108,141 @@ def start_live_safe(
     if profile not in PROFILE_PRESETS:
         raise ValueError(f"Unknown profile {profile}")
 
-    if trading_bot_running():
-        raise RuntimeError("Bot already running. Send /stop or /pause first.")
+    from kalshi_bot.process_ownership import record_ownership, refuse_if_conflict, start_lock
+    _lock = start_lock()
+    _lock.__enter__()
+    try:
+        conflict = refuse_if_conflict("live")
+        if conflict:
+            raise RuntimeError(conflict)
+        if trading_bot_running():
+            raise RuntimeError("heartbeat is fresh but trader identity is not confirmed")
 
-    stale = cleanup_stale_session()
-    c = KalshiClient()
-    pf = preflight_account(c)
-    if not pf.get("api_ok"):
-        raise RuntimeError("Cannot reach Kalshi API — fix network, then retry.")
+        stale = cleanup_stale_session()
+        c = KalshiClient()
+        pf = preflight_account(c)
+        if not pf.get("api_ok"):
+            raise RuntimeError("Cannot reach Kalshi API — fix network, then retry.")
 
-    opens = list(pf.get("opens") or [])
-    min_avail = float(getattr(cfg, "LIVE_MIN_AVAILABLE_USD", 2.0))
-    shard_balances = pf.get("shard_balances") or {}
-    total_cash = sum(float(v) for v in shard_balances.values())
-    if total_cash < min_avail:
-        raise RuntimeError(
-            f"Kalshi total cash ${total_cash:.2f} < min ${min_avail:.2f}. "
-            "Fund the account before live."
-        )
-    if opens and not force_with_opens:
-        tickers = ", ".join(str(o.get("ticker")) for o in opens[:6])
-        raise RuntimeError(
-            f"Kalshi still has {len(opens)} open position(s): {tickers}. "
-            "Wait for settlement, or send:\n"
-            f"/resume_live {profile} force"
-        )
+        opens = list(pf.get("opens") or [])
+        min_avail = float(getattr(cfg, "LIVE_MIN_AVAILABLE_USD", 2.0))
+        shard_balances = pf.get("shard_balances") or {}
+        total_cash = sum(float(v) for v in shard_balances.values())
+        if total_cash < min_avail:
+            raise RuntimeError(
+                f"Kalshi total cash ${total_cash:.2f} < min ${min_avail:.2f}. "
+                "Fund the account before live."
+            )
+        if opens and not force_with_opens:
+            tickers = ", ".join(str(o.get("ticker")) for o in opens[:6])
+            raise RuntimeError(
+                f"Kalshi still has {len(opens)} open position(s): {tickers}. "
+                "Wait for settlement, or send:\n"
+                f"/resume_live {profile} force"
+            )
 
-    # Crypto markets require cash on exchange shard 2 — fund from shard 0 if needed.
-    moved, fund_msg = c.ensure_crypto_shard_funded()
-    if moved > 0:
-        log.warning("Pre-live shard funding: %s", fund_msg)
-    pf = preflight_account(c)
-    available = float(pf["available"])
-    if available < min_avail:
-        shards = pf.get("shard_balances") or {}
-        raise RuntimeError(
-            f"Crypto shard available ${available:.2f} < min ${min_avail:.2f}. "
-            f"Shard balances: {shards}. Fund shard 0 or transfer manually in Kalshi UI."
-        )
+        # Crypto markets require cash on exchange shard 2 — fund from shard 0 if needed.
+        moved, fund_msg = c.ensure_crypto_shard_funded()
+        if moved > 0:
+            log.warning("Pre-live shard funding: %s", fund_msg)
+        pf = preflight_account(c)
+        available = float(pf["available"])
+        if available < min_avail:
+            shards = pf.get("shard_balances") or {}
+            raise RuntimeError(
+                f"Crypto shard available ${available:.2f} < min ${min_avail:.2f}. "
+                f"Shard balances: {shards}. Fund shard 0 or transfer manually in Kalshi UI."
+            )
 
-    # Critical: clear leftover /stop queue bits
-    prepare_for_new_round(source="safe_live_start")
+        # Critical: clear leftover /stop queue bits
+        prepare_for_new_round(source="safe_live_start")
 
-    n = rounds.next_round_number()
-    cap_i = int(round(available))
-    tag = session_tag or f"live_{n}_{profile}_{cap_i}"
-    # Floor sim-balance to cents available (LiveGuard will re-sync at bootstrap)
-    sim_bal = round(available, 2)
+        n = rounds.next_round_number()
+        cap_i = int(round(available))
+        tag = session_tag or f"live_{n}_{profile}_{cap_i}"
+        # Floor sim-balance to cents available (LiveGuard will re-sync at bootstrap)
+        sim_bal = round(available, 2)
 
-    py = sys.executable
-    script = str(PROJECT_ROOT / "run_kalshi_bot.py")
-    cmd = [
-        py,
-        script,
-        "--mode", "run",
-        "--live",
-        "--fresh-round",
-        "--sim-balance", str(sim_bal),
-        "--profile", profile,
-        "--session-tag", tag,
-    ]
-    if kelly is not None:
-        cmd.extend(["--kelly", str(kelly)])
-    if max_pos is not None:
-        cmd.extend(["--max-pos", str(max_pos)])
-    if portfolio_cap is not None:
-        cmd.extend(["--portfolio-cap", str(portfolio_cap)])
-    logs_dir = PROJECT_ROOT / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    out_path = logs_dir / "bot_stdout.log"
-    out_f = open(out_path, "a", encoding="utf-8")
-    out_f.write(f"\n\n===== SAFE LIVE start {tag} =====\n")
-    out_f.flush()
+        py = sys.executable
+        script = str(PROJECT_ROOT / "run_kalshi_bot.py")
+        cmd = [
+            py,
+            script,
+            "--mode", "run",
+            "--live",
+            "--fresh-round",
+            "--sim-balance", str(sim_bal),
+            "--profile", profile,
+            "--session-tag", tag,
+        ]
+        if kelly is not None:
+            cmd.extend(["--kelly", str(kelly)])
+        if max_pos is not None:
+            cmd.extend(["--max-pos", str(max_pos)])
+        if portfolio_cap is not None:
+            cmd.extend(["--portfolio-cap", str(portfolio_cap)])
+        logs_dir = PROJECT_ROOT / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        out_path = logs_dir / "bot_stdout.log"
+        out_f = open(out_path, "a", encoding="utf-8")
+        out_f.write(f"\n\n===== SAFE LIVE start {tag} =====\n")
+        out_f.flush()
 
-    kwargs: dict[str, Any] = {
-        "cwd": str(PROJECT_ROOT),
-        "stdout": out_f,
-        "stderr": subprocess.STDOUT,
-        "stdin": subprocess.DEVNULL,
-    }
-    if sys.platform == "win32":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+        kwargs: dict[str, Any] = {
+            "cwd": str(PROJECT_ROOT),
+            "stdout": out_f,
+            "stderr": subprocess.STDOUT,
+            "stdin": subprocess.DEVNULL,
+        }
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
 
-    log.warning("Spawning SAFE LIVE bot: %s", " ".join(cmd))
-    proc = subprocess.Popen(cmd, **kwargs)
+        log.warning("Spawning SAFE LIVE bot: %s", " ".join(cmd))
+        proc = subprocess.Popen(cmd, **kwargs)
+        ownership_state = "unverified"
+        try:
+            record_ownership("live", int(proc.pid), tag)
+            ownership_state = "running"
+        except Exception as exc:
+            log.warning("live ownership was not recorded: %s", exc)
+            ownership_state = "unverified"
 
-    ready = False
-    for _ in range(30):
-        time.sleep(0.4)
-        if trading_bot_running() or session_is_active():
-            ready = True
-            break
-        if proc.poll() is not None:
-            break
+        ready = False
+        for _ in range(30):
+            time.sleep(0.4)
+            if trading_bot_running() or session_is_active():
+                ready = True
+                break
+            if proc.poll() is not None:
+                break
 
-    preset = PROFILE_PRESETS[profile]
-    return {
-        "ok": ready or proc.poll() is None,
-        "pid": proc.pid,
-        "session_tag": tag,
-        "round": n,
-        "capital": sim_bal,
-        "profile": profile,
-        "kelly": preset.get("KELLY_FRACTION"),
-        "max_pos": preset.get("MAX_POS_PCT"),
-        "min_trade": preset.get("MIN_TRADE_USD"),
-        "ready": ready,
-        "exit_code": proc.poll(),
-        "log": str(Path(out_path).relative_to(PROJECT_ROOT)),
-        "available": available,
-        "portfolio": float(pf["portfolio"]),
-        "open_count": len(opens),
-        "stale_archived": bool(stale),
-        "live": True,
-        "force_with_opens": force_with_opens,
-    }
+        preset = PROFILE_PRESETS[profile]
+        return {
+            "ok": ready or proc.poll() is None,
+            "pid": proc.pid,
+            "session_tag": tag,
+            "round": n,
+            "capital": sim_bal,
+            "profile": profile,
+            "kelly": preset.get("KELLY_FRACTION"),
+            "max_pos": preset.get("MAX_POS_PCT"),
+            "min_trade": preset.get("MIN_TRADE_USD"),
+            "ready": bool(ready and ownership_state == "running"),
+            "spawned": proc.poll() is None,
+            "ownership": ownership_state,
+            "exit_code": proc.poll(),
+            "log": str(Path(out_path).relative_to(PROJECT_ROOT)),
+            "available": available,
+            "portfolio": float(pf["portfolio"]),
+            "open_count": len(opens),
+            "stale_archived": bool(stale),
+            "live": True,
+            "force_with_opens": force_with_opens,
+        }
+
+
+    finally:
+        _lock.__exit__(None, None, None)
 
 
 def format_account(pf: dict[str, Any]) -> str:

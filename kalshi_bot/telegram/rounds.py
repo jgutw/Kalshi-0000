@@ -83,6 +83,10 @@ PROFILE_ALIASES = {
     "engineered_risk": "engineered_risk",
     "safe": "engineered_risk",
     "live_safe": "live_safe",
+    "standard": "max_risk_paper",
+    "conservative": "engineered_risk",
+    "aggressive": "max_risk_micro",
+    "tight": "live_safe",
 }
 
 
@@ -272,14 +276,23 @@ def start_paper_round(
     Spawn run_kalshi_bot.py --fresh-round with the given capital/profile.
     Returns a result dict for Telegram formatting.
     """
-    if capital < 50 or capital > 100_000:
+    if capital != capital or capital in (float("inf"), float("-inf")) or capital < 50 or capital > 100_000:
         raise ValueError("Capital must be between $50 and $100000")
     profile = resolve_profile(profile)
     if profile not in PROFILE_PRESETS:
         raise ValueError(f"Unknown profile {profile}")
 
-    if trading_bot_running():
-        raise RuntimeError("Trading bot already running. Send /stop first.")
+    from kalshi_bot.process_ownership import record_ownership, refuse_if_conflict, start_lock
+    with start_lock():
+        conflict = refuse_if_conflict("paper")
+        if conflict:
+            raise RuntimeError(conflict)
+        if trading_bot_running():
+            raise RuntimeError("heartbeat is fresh but trader identity is not confirmed")
+        return _spawn_paper_round(capital, profile, round_n)
+
+
+def _spawn_paper_round(capital, profile, round_n):
     if session_is_active():
         raise RuntimeError(
             "A session is still marked active. Send /stop first (archives + clears)."
@@ -325,6 +338,11 @@ def start_paper_round(
 
     log.info("Spawning paper bot: %s", " ".join(cmd))
     proc = subprocess.Popen(cmd, **kwargs)
+    try:
+        from kalshi_bot.process_ownership import record_ownership
+        record_ownership("paper", int(proc.pid), tag)
+    except Exception as exc:
+        log.warning("paper ownership was not recorded: %s", exc)
 
     # Wait briefly for heartbeat / meta
     ready = False

@@ -53,11 +53,19 @@ class AlertWatcher:
             return 0
 
     def poll(self, send: SendFn) -> None:
-        self._poll_jsonl(TRADES_PATH, "_trade_pos", self._on_trade, send)
-        self._poll_jsonl(SKIMS_PATH, "_skim_pos", self._on_skim, send)
-        self._poll_jsonl(NOTICES_PATH, "_notice_pos", self._on_notice, send)
-        self._poll_halt(send)
-        self._poll_heartbeat(send)
+        from kalshi_bot.operator_control import mode_banner
+        banner = mode_banner()
+
+        def tagged(text: str) -> None:
+            if banner and not text.startswith(banner.strip()):
+                text = banner + text
+            send(text)
+
+        self._poll_jsonl(TRADES_PATH, "_trade_pos", self._on_trade, tagged)
+        self._poll_jsonl(SKIMS_PATH, "_skim_pos", self._on_skim, tagged)
+        self._poll_jsonl(NOTICES_PATH, "_notice_pos", self._on_notice, tagged)
+        self._poll_halt(tagged)
+        self._poll_heartbeat(tagged)
 
     def _poll_jsonl(
         self,

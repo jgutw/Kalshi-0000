@@ -53,8 +53,8 @@ class TelegramBridge:
                 continue
             if not text:
                 continue
-            log.info("Telegram cmd from %s: %s", chat, text[:80])
-            handle_command(text, self.send)
+            log.info("Telegram cmd chat accepted")
+            handle_command(text, self.send, chat_id=str(chat))
 
     def alert_loop(self) -> None:
         while not self._stop.is_set():

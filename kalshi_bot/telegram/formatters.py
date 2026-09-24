@@ -56,14 +56,22 @@ def format_help() -> str:
         "\n"
         "Views\n"
         "  /status  /account  /live  /risk  /positions\n"
-        "  /router  /why  /trades [n]  /windows\n"
-        "  /losses  /vault  /summary  /sizing  /help\n"
+        "  /why  /trades [n]  /summary  /sizing  /profile  /vault\n"
         "\n"
-        "Control\n"
-        "  /pause   stop new entries\n"
-        "  /stop    stop the bot\n"
+        "Risk reducing\n"
+        "  /pause   stop new entries; does not liquidate\n"
+        "  /stop    stop the process; does not close Kalshi positions\n"
         "\n"
-        "Remote start, cash movement, resume, and risk changes are refused.\n"
+        "Capital changes require a one-use confirmation\n"
+        "  /papertrade <capital> [profile]\n"
+        "  /shadow <new-session-id> <starting-balance>\n"
+        "  /start_live\n"
+        "  /resume    clears manual pause only\n"
+        "  /take_cash <usd>   /vault_auto status|on|off   /vault_set <trigger> <skim>\n"
+        "  /profile <name>    /set_max_pos /set_min_trade /set_kelly\n"
+        "  /set_portfolio_cap /set_consec_losses /set_daily_loss /set_max_drawdown\n"
+        "\n"
+        "/start does not start a trader. /go and /safe_live do not start trading.\n"
         "Only your TELEGRAM_CHAT_ID is accepted."
     )
 
@@ -320,22 +328,28 @@ def format_summary() -> str:
 
 
 def format_sizing() -> str:
+    from kalshi_bot.bankroll import trading_bankroll_cap
+    from kalshi_bot.telegram.rounds import PROFILE_ALIASES
+    cap_amt = trading_bankroll_cap()
+    bankroll_line = "Trading bankroll: unset (sizes from tradeable cash)" if cap_amt is None else f"Trading bankroll: ${cap_amt:,.2f}"
+    aliases = "\n".join(
+        f"  {name} -> {preset} kelly={PROFILE_PRESETS[preset]['KELLY_FRACTION']} "
+        f"pos={PROFILE_PRESETS[preset]['MAX_POS_PCT']:.0%} gross={PROFILE_PRESETS[preset]['PORTFOLIO_GROSS_CAP']:.0%}"
+        for name, preset in PROFILE_ALIASES.items()
+        if preset in PROFILE_PRESETS
+    )
     if not session_is_active() and not trading_bot_running():
         return (
-            "No active round — sizing presets apply when you start one.\n"
+            "SIZING\n"
+            "Production live sizes from Kalshi available cash minus vault.\n"
+            "Shadow Era 1C sizes from realized gross equity. Live does not.\n"
+            f"{bankroll_line}\n"
+            "Set it with /bankroll <dollars>, then confirm.\n"
             "\n"
-            "Easiest:\n"
-            "  /go standard     ($500 max_risk)\n"
-            "  /go big          ($2000 max_risk)\n"
-            "  /go micro        ($200 micro)\n"
-            "  /presets         (recipes + past Excel results)\n"
-            "  /start_round 500\n"
+            "Profiles (existing presets, Kelly math unchanged):\n"
+            f"{aliases}\n"
             "\n"
-            "After a round is running, tweak with:\n"
-            "  /set_max_pos 8\n"
-            "  /set_min_trade 5\n"
-            "  /set_kelly 0.5\n"
-            "  /profile max_risk_micro"
+            "Official live start remains /start_live (max_risk_micro)."
         )
     kelly = float(_live("KELLY_FRACTION", cfg.KELLY_FRACTION))
     max_pos = float(_live("MAX_POS_PCT", cfg.MAX_POS_PCT))
@@ -346,7 +360,10 @@ def format_sizing() -> str:
     profile = str(_live("CONFIG_PROFILE", cfg.CONFIG_PROFILE))
     return "\n".join(
         [
-            "Current sizing (live bot)",
+            "SIZING",
+            "Live base = Kalshi available cash - vault, then the trading-bankroll cap.",
+            "The position cap below is the ceiling. Kelly and volatility can size under it.",
+            bankroll_line,
             f"profile={profile}",
             f"KELLY_FRACTION={kelly}",
             f"MAX_POS_PCT={max_pos:.2%}",

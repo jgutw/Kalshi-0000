@@ -159,7 +159,11 @@ async def _consume_yes_mid(pipeline: ShadowEntry, engine, yes_mid: float) -> Non
 async def _price_loop(pipeline: ShadowEntry, engine: AssetEngine, telemetry: FeedTelemetry) -> None:
     streak = 0
     heartbeat = 0.0
+    from pathlib import Path
+    stop_flag = Path(__file__).resolve().parent / "logs" / "shadow_stop.request"
     while True:
+        if stop_flag.exists():
+            return
         try:
             pipeline.settle_if_due(engine)
             series = pipeline.refresh_window(engine)
@@ -209,6 +213,12 @@ async def _watch_feed(pipeline: ShadowEntry, name: str, coro) -> None:
 
 
 async def run(args) -> None:
+    from pathlib import Path
+    stop_flag = Path(__file__).resolve().parent / "logs" / "shadow_stop.request"
+    if args.new:
+        stop_flag.unlink(missing_ok=True)
+    elif stop_flag.exists():
+        return
     session, balance = open_session(args)
     pipeline = ShadowEntry(session, ReadOnlyKalshi(
         read_base_url(),
@@ -227,6 +237,14 @@ async def run(args) -> None:
                  for symbol, engine in engines.items()]
         for name, coro in public_feed_coros(engines, telemetry):
             tasks.append(asyncio.create_task(_watch_feed(pipeline, name, coro), name=name))
+
+        async def _stop_when_requested() -> None:
+            while not stop_flag.exists():
+                await asyncio.sleep(0.5)
+            for task in tasks:
+                task.cancel()
+
+        tasks.append(asyncio.create_task(_stop_when_requested(), name="shadow-stop"))
         await asyncio.gather(*tasks)
     except Exception as exc:
         pipeline.operational("uncaught_loop_error", error=str(exc))

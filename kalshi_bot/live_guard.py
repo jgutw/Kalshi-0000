@@ -117,7 +117,8 @@ class LiveGuard:
             )
             vault = max(0.0, available + portfolio)
             self.sim.vault_balance = vault
-        tradeable = max(0.0, available - vault)
+        from kalshi_bot.bankroll import sizing_cash
+        tradeable, _basis = sizing_cash(available, vault)
 
         local_open = float(sum(p.amount_usdc for p in open_positions))
         # Defense: if get_balance_detail ever hands us cents again, a $9.40
