@@ -10,9 +10,11 @@ import streamlit as st
 
 from dashboard.components.probability_stack_chart import render_probability_stack_chart
 from dashboard.components.reason_breakdown import render_reason_breakdown
+from dashboard.components.mode_banner import render_production_banner
 from dashboard.components.sidebar import render_sidebar
 from dashboard.data.state_store import StateStore
 
+render_production_banner()
 auto_refresh = render_sidebar(refresh_secs=8)
 store = StateStore()
 snapshots = store.get_latest_snapshots()

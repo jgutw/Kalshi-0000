@@ -19,7 +19,7 @@ from kalshi_bot.shadow_report import INTEGRITY_FAILED, SessionPathError, analyze
 def _args():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--root", default="shadow_data")
-    parser.add_argument("--session", default="shadow_era1b_001")
+    parser.add_argument("--session", default="")
     known, _ = parser.parse_known_args()
     return known
 
@@ -85,9 +85,24 @@ def _page(*, embedded: bool = False) -> None:
     st.title("Shadow")
     st.caption("Simulated execution · research settlement · Shadow portfolio · read-only")
     root = st.sidebar.text_input("Root", args.root)
-    session = st.sidebar.text_input("Session", args.session)
+    session = st.sidebar.text_input("Session", args.session, help="Historical session id. Nothing starts when this is opened.")
     if st.sidebar.button("Refresh"):
         st.rerun()
+    running = False
+    try:
+        from dashboard.operator_view import observe_ownership
+        state, mode, owned_session = observe_ownership()
+        running = state == "running" and mode == "shadow" and owned_session == session.strip()
+    except Exception:
+        st.caption("Process ownership unavailable.")
+    if running:
+        st.markdown("**RUNNING NOW**")
+    else:
+        st.markdown("**HISTORICAL — NOT RUNNING**")
+        st.caption("Opening this page does not start Shadow.")
+    if not session.strip():
+        st.info("No session selected. Shadow is not running unless an owned Shadow process exists.")
+        return
     try:
         path = resolve_session(root, session)
     except SessionPathError as exc:
@@ -97,7 +112,7 @@ def _page(*, embedded: bool = False) -> None:
         st.error(f"No session metadata at {path}")
         return
     report = analyze(path)
-    _health(report)
+    _health(report, running=running)
     _funnel(report)
     if report["performance_withheld"]:
         st.error(INTEGRITY_FAILED)
@@ -109,7 +124,7 @@ def _page(*, embedded: bool = False) -> None:
     _research(report)
 
 
-def _health(report) -> None:
+def _health(report, *, running: bool) -> None:
     st.subheader("System health")
     st.caption("SHADOW / NO CAPITAL")
     st.caption("RESEARCH SETTLEMENT — NOT OFFICIAL KALSHI SETTLEMENT")
@@ -129,8 +144,19 @@ def _health(report) -> None:
     cols = st.columns(4)
     cols[0].metric("Open positions", opens if opens is not None else "withheld")
     cols[1].metric("Heartbeat age", _age(report["last_heartbeat_utc"], report["now_utc"]))
-    cols[2].metric("Runtime", _age(report["startup_utc"], report["shutdown_utc"] or report["now_utc"]))
+    end = report["shutdown_utc"]
+    if running:
+        runtime = _age(report["startup_utc"], report["now_utc"])
+        end_label = "still running"
+    elif end:
+        runtime = _age(report["startup_utc"], end)
+        end_label = _stamp(end)
+    else:
+        runtime = "unavailable"
+        end_label = "end time unavailable"
+    cols[2].metric("Runtime", runtime)
     cols[3].metric("Loaded SHA", sha[:12] or "—")
+    st.caption(f"Session end: {end_label}")
     feeds = equity.get("equity_feeds_sizing") if equity else None
     basis = sizing_basis_label(feeds)
     st.markdown(f"**{basis or 'Sizing basis withheld'}**")

@@ -20,10 +20,7 @@ def render_sidebar(refresh_secs: int = 5) -> bool:
 
     with st.sidebar:
         if store.is_mock_mode():
-            st.markdown(
-                '<div class="mock-banner">⚠️ <b>MOCK MODE</b> — no live logs</div>',
-                unsafe_allow_html=True,
-            )
+            st.warning("UNAVAILABLE — source data not present")
             st.divider()
 
         portfolio = store.get_portfolio()
@@ -31,7 +28,8 @@ def render_sidebar(refresh_secs: int = 5) -> bool:
         total_pnl = equity - portfolio.starting_balance
         pnl_pct = (total_pnl / portfolio.starting_balance * 100) if portfolio.starting_balance else 0
 
-        st.metric("Equity", f"${equity:,.2f}", f"{pnl_pct:+.1f}%")
+        st.metric("Local equity", f"${equity:,.2f}", f"{pnl_pct:+.1f}%")
+        st.caption("BOT / LOCAL. Not Kalshi account equity.")
         st.caption(f"Trading ${portfolio.balance:,.0f} · Vault ${portfolio.vault_balance:,.0f}")
         st.caption(f"WR {portfolio.win_rate:.0%} · Sharpe {portfolio.sharpe:.2f}")
 
@@ -41,7 +39,7 @@ def render_sidebar(refresh_secs: int = 5) -> bool:
                 unsafe_allow_html=True,
             )
         else:
-            st.success("Running OK" if not store.is_mock_mode() else "Mock OK")
+            st.caption("No halt flag in the local book")
 
         with st.expander("Vault / Take cash", expanded=False):
             render_vault_panel()

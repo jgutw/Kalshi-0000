@@ -11,8 +11,11 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from dashboard.components.mode_banner import render_production_banner
 from dashboard.components.sidebar import render_sidebar
 from dashboard.data.state_store import StateStore
+
+render_production_banner()
 from dashboard.data.loaders import load_working_fills
 
 auto_refresh = render_sidebar(refresh_secs=8)
@@ -20,7 +23,8 @@ store = StateStore()
 trades = store.get_trades()
 portfolio = store.get_portfolio()
 
-st.title("Journal")
+st.title("Production journal")
+st.caption("LOCAL PRODUCTION LOG. P&L is the logged pnl field. Fee treatment is unknown unless a fee field is present.")
 st.caption("Closed trades — risked premium vs realized P&L. Working fills appear above the table.")
 
 working = load_working_fills()
@@ -47,19 +51,23 @@ if not trades:
     st.stop()
 
 wins = [t for t in trades if t.pnl > 0]
-losses = [t for t in trades if t.pnl <= 0]
+losses = [t for t in trades if t.pnl < 0]
+scratches = [t for t in trades if t.pnl == 0]
 total_pnl = sum(t.pnl for t in trades)
 total_risked = sum(t.amount_usdc for t in trades)
 best = max(trades, key=lambda x: x.pnl)
 worst = min(trades, key=lambda x: x.pnl)
 
-c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
 c1.metric("Trades", len(trades))
-c2.metric("Win rate", f"{(len(wins) / len(trades)):.0%}")
-c3.metric("P&L", f"${total_pnl:+,.2f}")
-c4.metric("Risked (sum)", f"${total_risked:,.0f}")
-c5.metric("Best", f"${best.pnl:+,.2f}")
-c6.metric("Worst", f"${worst.pnl:+,.2f}")
+c2.metric("Wins", len(wins))
+c3.metric("Losses", len(losses))
+c4.metric("Scratches", len(scratches))
+c5.metric("Logged P&L", f"${total_pnl:+,.2f}")
+c6.metric("Best", f"${best.pnl:+,.2f}")
+c7.metric("Worst", f"${worst.pnl:+,.2f}")
+st.caption("Logged P&L uses the local pnl field. Fee treatment: unknown.")
+st.caption(f"Risked (sum, local): ${total_risked:,.0f}")
 
 # Main table first (practical)
 rows = []

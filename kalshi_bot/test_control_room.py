@@ -54,3 +54,54 @@ class EnvironmentTests(unittest.TestCase):
         self.assertFalse((entry.parent / "pages").exists())
         self.assertNotIn("dashboard/control_room.py", entry.read_text(encoding="utf-8").replace("\\", "/"))
         self.assertIn("from dashboard.control_room import main", entry.read_text(encoding="utf-8"))
+
+
+class TruthfulnessTests(unittest.TestCase):
+    def test_mode_labels(self):
+        from dashboard.operator_view import production_banner, production_mode, shadow_banner, shadow_running
+        self.assertEqual(production_mode("running", "paper"), "PAPER")
+        self.assertEqual(production_banner("PAPER"), "PAPER — NO REAL CAPITAL")
+        self.assertNotIn("LIVE", production_banner("PAPER"))
+        self.assertEqual(production_mode("running", "live"), "LIVE")
+        self.assertEqual(production_mode("stopped", "live"), "UNKNOWN")
+        self.assertEqual(production_mode("running", ""), "UNKNOWN")
+        self.assertIn("MODE UNKNOWN", production_banner("UNKNOWN"))
+        self.assertNotIn("LIVE —", production_banner("UNKNOWN"))
+        self.assertFalse(shadow_running("stopped", "shadow"))
+        self.assertTrue(shadow_running("running", "shadow"))
+        self.assertIn("HISTORICAL — NOT RUNNING", shadow_banner(False))
+        self.assertIn("RUNNING NOW", shadow_banner(True))
+
+    def test_scratch_is_not_a_loss(self):
+        from dashboard.operator_view import trade_outcome
+        self.assertEqual(trade_outcome(1), "win")
+        self.assertEqual(trade_outcome(-1), "loss")
+        self.assertEqual(trade_outcome(0), "scratch")
+
+    def test_live_ceiling_is_not_the_dashboard_default(self):
+        from dashboard.operator_view import loss_streak_ceiling
+        self.assertEqual(loss_streak_ceiling("LIVE", 8), 3)
+        self.assertIsNone(loss_streak_ceiling("UNKNOWN", 8))
+
+    def test_shadow_page_does_not_spawn_or_default_era1b(self):
+        source = (ROOT / "dashboard" / "shadow_app.py").read_text(encoding="utf-8")
+        self.assertNotIn("Popen", source)
+        self.assertNotIn("subprocess", source)
+        self.assertNotIn('default="shadow_era1b_001"', source)
+        self.assertIn("HISTORICAL — NOT RUNNING", source)
+        self.assertIn("end time unavailable", source)
+
+    def test_operational_loaders_do_not_mock_money(self):
+        source = (ROOT / "dashboard" / "data" / "loaders.py").read_text(encoding="utf-8")
+        self.assertNotIn("generate_trades", source)
+        self.assertNotIn("generate_portfolio", source)
+
+    def test_exchange_failure_is_not_local_equity(self):
+        source = (ROOT / "dashboard" / "pages" / "00_ops.py").read_text(encoding="utf-8")
+        self.assertIn("EXCHANGE DATA UNAVAILABLE", source)
+        self.assertIn("not exchange", source)
+        self.assertNotIn("generate_portfolio", source)
+        room = (ROOT / "dashboard" / "control_room.py").read_text(encoding="utf-8")
+        self.assertNotIn('title="Live', room)
+        self.assertIn("Loss-streak ceiling: 3", (ROOT / "dashboard" / "pages" / "00_ops.py").read_text(encoding="utf-8"))
+        self.assertNotIn("reconcile()", (ROOT / "dashboard" / "shadow_app.py").read_text(encoding="utf-8"))

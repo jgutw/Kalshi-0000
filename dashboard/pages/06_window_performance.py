@@ -9,9 +9,11 @@ import time
 import pandas as pd
 import streamlit as st
 
+from dashboard.components.mode_banner import render_production_banner
 from dashboard.components.sidebar import render_sidebar
 from dashboard.data.state_store import StateStore
 
+render_production_banner()
 auto_refresh = render_sidebar(refresh_secs=8)
 store = StateStore()
 rows = store.get_window_performance()

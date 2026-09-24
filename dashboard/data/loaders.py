@@ -12,12 +12,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .mock_data import (
-    generate_decisions,
-    generate_portfolio,
-    generate_state_snapshots,
-    generate_trades,
-)
 from .schemas import DecisionEvent, PortfolioSnapshot, StateSnapshot, TradeEvent
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -52,18 +46,27 @@ def _live_logs_present() -> bool:
     return True
 
 
+def _empty_portfolio() -> PortfolioSnapshot:
+    return PortfolioSnapshot(
+        ts="", balance=0.0, starting_balance=0.0, peak_balance=0.0,
+        total_trades=0, wins=0, losses=0, win_rate=0.0, sharpe=0.0,
+        var_95=0.0, consec_losses=0, halt_state=False, halt_reason="",
+        asset_stats={},
+    )
+
+
 def load_portfolio() -> PortfolioSnapshot:
-    """Load from kalshi_sim.json or return mock."""
+    """Load from kalshi_sim.json. Missing file is an empty snapshot, never mock numbers."""
     try:
         if not SIM_PATH.exists() or SIM_PATH.stat().st_size == 0:
-            return generate_portfolio()
+            return _empty_portfolio()
         with open(SIM_PATH, encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, IOError):
-        return generate_portfolio()
+        return _empty_portfolio()
 
-    balance = _safe_float(data.get("balance"), 1000.0)
-    start = _safe_float(data.get("starting_balance"), 1000.0)
+    balance = _safe_float(data.get("balance"), 0.0)
+    start = _safe_float(data.get("starting_balance"), 0.0)
     peak = _safe_float(data.get("peak_balance"), balance)
     total = int(data.get("total_trades", 0))
     wins = int(data.get("wins", 0))
@@ -84,46 +87,8 @@ def load_portfolio() -> PortfolioSnapshot:
     var_95 = _safe_float(data.get("var_95"), 0.0)
     consec = int(data.get("consec_losses", 0))
 
-    # Mirror kalshi_bot.sim_state.is_halted() so the banner shows the real reason.
-    # (Old logic labeled every halt as consec_loss_cooldown and used consec>=3.)
-    try:
-        from kalshi_bot.config import cfg as _cfg
-        max_dd = float(getattr(_cfg, "MAX_DRAWDOWN_PCT", 0.25))
-        dd_enabled = bool(getattr(_cfg, "DRAWDOWN_HALT_ENABLED", True))
-        dd_equity = bool(getattr(_cfg, "DRAWDOWN_USE_EQUITY", True))
-        max_daily = float(getattr(_cfg, "MAX_DAILY_LOSS_PCT", 0.40))
-        max_consec = int(getattr(_cfg, "MAX_CONSEC_LOSSES", 8))
-    except Exception:
-        max_dd, dd_enabled, dd_equity, max_daily, max_consec = 0.25, True, True, 0.40, 8
-
-    daily_start = _safe_float(data.get("daily_start"), start)
-    daily_dd = ((daily_start - balance) / daily_start) if daily_start > 0 else 0.0
-    vault_tmp = _safe_float(data.get("vault_balance"), 0.0)
-    equity_tmp = _safe_float(data.get("total_equity"), balance + vault_tmp)
-    peak_eq = _safe_float(data.get("peak_equity"), equity_tmp)
-    if dd_equity:
-        peak_dd = ((peak_eq - equity_tmp) / peak_eq) if peak_eq > 0 else 0.0
-        dd_label = "max_drawdown_equity"
-    else:
-        peak_dd = ((peak - balance) / peak) if peak > 0 else 0.0
-        dd_label = "max_drawdown_trading"
-
-    halted = False
-    halt_reason = ""
-    if daily_dd >= max_daily:
-        halted, halt_reason = True, f"daily_loss {daily_dd:.1%}"
-    elif dd_enabled and peak_dd >= max_dd:
-        halted, halt_reason = True, f"{dd_label} {peak_dd:.1%}>={max_dd:.0%}"
-    elif data.get("_halted_at") is not None or consec >= max_consec:
-        halted, halt_reason = True, "consec_loss_cooldown"
-    else:
-        by_asset = data.get("consec_losses_by_asset") or {}
-        halted_assets = data.get("_halted_at_by_asset") or {}
-        if isinstance(by_asset, dict):
-            for sym, streak in by_asset.items():
-                if int(streak or 0) >= max_consec or (isinstance(halted_assets, dict) and sym in halted_assets):
-                    halted, halt_reason = True, f"consec_loss_cooldown[{sym}]"
-                    break
+    halt_reason = str(data.get("live_halt_reason") or "")
+    halted = bool(halt_reason)
 
     asset_stats = {}
     for k, v in _safe_dict(data.get("asset_stats")).items():
@@ -142,7 +107,7 @@ def load_portfolio() -> PortfolioSnapshot:
     # Prefer a live mark that includes open event contracts. Persisted
     # total_equity used to be cash+vault only, which understated live equity
     # whenever positions were open.
-    equity = balance + vault + max(0.0, kalshi_port)
+    equity = balance + vault
     skimmable = max(0.0, balance - start)
 
     live_halt = str(data.get("live_halt_reason") or "").strip()
@@ -278,11 +243,11 @@ def load_trades() -> List[TradeEvent]:
                     events.append(ev)
                     seen.add(key)
         if not events:
-            return [] if live else generate_trades()
+            return [] if live else []
         events.sort(key=lambda e: e.ts or "")
         return events
     except (IOError, json.JSONDecodeError):
-        return [] if live else generate_trades()
+        return []
 
 
 def load_decisions(asset: Optional[str] = None, last_n: int = 500) -> List[DecisionEvent]:
@@ -290,7 +255,7 @@ def load_decisions(asset: Optional[str] = None, last_n: int = 500) -> List[Decis
     events: List[DecisionEvent] = []
     try:
         if not DECISIONS_PATH.exists() or DECISIONS_PATH.stat().st_size == 0:
-            all_events = generate_decisions()
+            return []
         else:
             with open(DECISIONS_PATH, encoding="utf-8") as f:
                 for line in f:
@@ -337,15 +302,12 @@ def load_decisions(asset: Optional[str] = None, last_n: int = 500) -> List[Decis
                         kalshi_quote_age_secs=_safe_float(d.get("kalshi_quote_age_secs"), 0.0),
                         kalshi_spread=_safe_float(d.get("kalshi_spread"), 0.0),
                     ))
-            all_events = events if events else generate_decisions()
+            all_events = events
         if asset:
             all_events = [e for e in all_events if e.asset == asset]
         return all_events[-last_n:]
     except IOError:
-        ev = generate_decisions()
-        if asset:
-            ev = [e for e in ev if e.asset == asset]
-        return ev[-last_n:]
+        return []
 
 
 def _enabled_assets() -> list:
@@ -424,8 +386,8 @@ def load_latest_snapshots() -> dict:
         open_map = _load_open_positions_map()
         live = _live_logs_present()
         enabled = set(_enabled_assets())
-        if not decisions and not live:
-            return generate_state_snapshots()
+        if not decisions:
+            return {}
 
         snapshots = {}
         for asset in _dashboard_assets():
@@ -488,11 +450,10 @@ def load_latest_snapshots() -> dict:
                     snap.router_action = "WAIT"
                 snapshots[asset] = snap
             else:
-                mock = generate_state_snapshots()
-                snapshots[asset] = mock.get(asset, mock["BTC"])
+                snapshots[asset] = _placeholder_snapshot(asset, portfolio, "UNAVAILABLE — source data not present")
         return snapshots
     except Exception:
-        return generate_state_snapshots()
+        return {}
 
 
 def _window_display(wid: str) -> str:

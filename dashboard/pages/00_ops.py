@@ -12,8 +12,21 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from dashboard.components.mode_banner import render_production_banner
 from dashboard.components.sidebar import render_sidebar
 from dashboard.data.state_store import StateStore
+
+st.caption("KALSHI / EXCHANGE")
+try:
+    from kalshi_bot.safe_live import preflight_account
+    pf = preflight_account()
+    if pf.get("api_ok"):
+        st.metric("Available cash (exchange)", f"${float(pf.get('available') or 0):,.2f}")
+        st.metric("Open positions (exchange)", int(pf.get("open_count") or 0))
+    else:
+        st.error("EXCHANGE DATA UNAVAILABLE")
+except Exception:
+    st.error("EXCHANGE DATA UNAVAILABLE")
 
 auto_refresh = render_sidebar(refresh_secs=5)
 store = StateStore()
@@ -59,22 +72,25 @@ def _feed_label(conf: float, reason: str, has_spot: bool) -> str:
 
 
 st.title("Ops")
-st.caption("Live book — scan left→right. Detail lives on Asset / Windows.")
+st.caption("BOT / LOCAL book. Not Kalshi account equity. Detail lives on Asset / Windows.")
+mode = render_production_banner()
+if mode == "LIVE":
+    st.caption("Loss-streak ceiling: 3")
 
 # Compact portfolio strip
 equity = portfolio.total_equity or (portfolio.balance + portfolio.vault_balance)
 pnl = equity - portfolio.starting_balance
 pnl_pct = (pnl / portfolio.starting_balance * 100) if portfolio.starting_balance else 0.0
 c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("Trading", f"${portfolio.balance:,.0f}")
-c2.metric("Vault", f"${portfolio.vault_balance:,.0f}")
-c3.metric("Equity", f"${equity:,.0f}", f"{pnl_pct:+.1f}%")
+c1.metric("Trading (BOT / LOCAL)", f"${portfolio.balance:,.0f}")
+c2.metric("Vault (BOT / LOCAL)", f"${portfolio.vault_balance:,.0f}")
+c3.metric("Local equity (not exchange)", f"${equity:,.0f}", f"{pnl_pct:+.1f}%")
 c4.metric("WR", f"{portfolio.win_rate:.0%}")
 c5.metric("Trades", f"{portfolio.total_trades}")
 if portfolio.halt_state:
     c6.error("HALT")
 else:
-    c6.success("OK")
+    c6.caption("No halt flag")
 if portfolio.halt_state and portfolio.halt_reason:
     st.error(portfolio.halt_reason)
 
@@ -87,7 +103,7 @@ if _dec.exists():
     else:
         st.caption(f"Logs {age:.0f}s ago")
 else:
-    st.info("No live decision log yet (idle or mock).")
+    st.info("UNAVAILABLE — source data not present")
 
 rows = []
 for asset in assets:

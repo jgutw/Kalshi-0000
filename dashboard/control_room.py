@@ -43,10 +43,13 @@ def landing() -> None:
         if st.button("Enter Shadow", type="primary", key="enter-shadow"):
             st.switch_page(shadow_page)
     with live:
-        st.subheader("LIVE")
-        st.markdown("### REAL CAPITAL")
-        st.markdown(LIVE_COPY)
-        if st.button("Enter Live", type="primary", key="enter-live"):
+        st.subheader("PRODUCTION")
+        st.markdown("### MODE FROM THE OWNED PROCESS")
+        st.markdown(
+            "Paper and live share this dashboard. The page banner states which one is running. "
+            "It does not start a trader."
+        )
+        if st.button("Enter production", type="primary", key="enter-live"):
             st.switch_page(live_ops_page)
 
 
@@ -59,16 +62,19 @@ def shadow_room() -> None:
 
 def _live(script: Path, key: str):
     def run() -> None:
-        st.markdown("**LIVE — REAL CAPITAL**")
+        from dashboard.operator_view import observe_ownership, production_banner, production_mode
+        state, mode_name, _session = observe_ownership()
+        banner = production_banner(production_mode(state, mode_name))
+        st.markdown(f"**{banner}**")
         if st.button("Environment selection", key=f"back-{key}"):
             st.session_state[LIVE_ACK_KEY] = False
             st.switch_page(landing_page)
         if not live_controls_open(dict(st.session_state)):
-            st.header("LIVE")
-            st.subheader("REAL CAPITAL")
-            st.error(LIVE_ACK_TEXT)
+            st.header(banner)
+            if "LIVE —" in banner:
+                st.error(LIVE_ACK_TEXT)
             st.markdown(LIVE_COPY)
-            if st.button("Enter live controls", key=f"ack-{key}"):
+            if st.button("Enter production view", key=f"ack-{key}"):
                 st.session_state[LIVE_ACK_KEY] = True
                 st.rerun()
             return
@@ -78,10 +84,10 @@ def _live(script: Path, key: str):
 
 landing_page = st.Page(landing, title="Control Room", default=True)
 shadow_page = st.Page(shadow_room, title="Shadow", url_path="shadow")
-live_ops_page = st.Page(_live(PAGES / "00_ops.py", "ops"), title="Live Ops", url_path="live-ops")
-live_asset_page = st.Page(_live(PAGES / "01_mission_control.py", "asset"), title="Live Asset", url_path="live-asset")
-live_journal_page = st.Page(_live(PAGES / "02_trade_journal.py", "journal"), title="Live Journal", url_path="live-journal")
-live_windows_page = st.Page(_live(PAGES / "06_window_performance.py", "windows"), title="Live Windows", url_path="live-windows")
+live_ops_page = st.Page(_live(PAGES / "00_ops.py", "ops"), title="Ops", url_path="live-ops")
+live_asset_page = st.Page(_live(PAGES / "01_mission_control.py", "asset"), title="Asset", url_path="live-asset")
+live_journal_page = st.Page(_live(PAGES / "02_trade_journal.py", "journal"), title="Journal", url_path="live-journal")
+live_windows_page = st.Page(_live(PAGES / "06_window_performance.py", "windows"), title="Windows", url_path="live-windows")
 
 
 def main() -> None:
