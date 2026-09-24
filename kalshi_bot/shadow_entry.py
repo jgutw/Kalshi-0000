@@ -17,6 +17,7 @@ import uuid
 from .asset_engine import _floor_strike_from_market
 from .config import cfg
 from .shadow_journal import JournalError, strict_loads
+from .shadow_report import _chain
 from .shadow_market import BookIdentityError
 from .shadow_settlement import SETTLEMENT_METHOD, window_close_ts
 from .sim_state import OpenPosition, SimState
@@ -101,6 +102,48 @@ def record_starting_balance(session, amount: float) -> None:
     })
 
 
+def realized_gross_equity(session) -> tuple[float | None, str | None]:
+    """E_t from the starting-balance record plus verified CLOSED gross P&L.
+
+    A torn final line keeps the verified prefix. Corruption, a nonfinite close,
+    or E_t <= 0 blocks new risk. There is no fallback to the starting balance.
+    """
+    try:
+        start = load_starting_balance(session)
+    except ValueError:
+        return None, "sizing_blocked:starting_balance"
+    path = session.directory / "lifecycle.jsonl"
+    lines = []
+    if path.is_file():
+        lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    events, chain_ok, _torn, _note = _chain(lines)
+    if not chain_ok:
+        return None, "sizing_blocked:lifecycle_integrity"
+    total = 0.0
+    seen = set()
+    for event in events:
+        if event.get("kind") != "CLOSED":
+            continue
+        payload = event.get("payload")
+        if type(payload) is not dict:
+            return None, "sizing_blocked:invalid_close_pnl"
+        close_id = payload.get("close_id")
+        if close_id in seen:
+            return None, "sizing_blocked:duplicate_close"
+        if close_id is not None:
+            seen.add(close_id)
+        pnl = payload.get("gross_pnl")
+        if isinstance(pnl, bool) or type(pnl) not in (int, float) or not math.isfinite(pnl):
+            return None, "sizing_blocked:invalid_close_pnl"
+        total += float(pnl)
+    equity = start + total
+    if not math.isfinite(equity):
+        return None, "sizing_blocked:nonfinite_equity"
+    if equity <= 0:
+        return None, "sizing_blocked:nonpositive_equity"
+    return equity, None
+
+
 def load_starting_balance(session) -> float:
     path = session.directory / "operational_events.jsonl"
     if not path.is_file():
@@ -180,6 +223,21 @@ class ShadowEntry:
                     engine._price_to_beat = price
                     engine._price_to_beat_source = "window_open_spot"
 
+    def _apply_sizing_equity(self, engine) -> None:
+        """Replace the frozen bankroll with realized gross equity. Never mutates sim.balance.
+
+        Dynamic sizing is this code path. ``sizing_basis`` is reporting provenance
+        only, so this build must not be resumed against an Era 1B directory.
+        ``sizing_blocked`` dedup is process-local. Daily-loss and drawdown halts
+        still watch frozen sim.balance and do not track realized gross P&L.
+        """
+        equity, reason = realized_gross_equity(self.session)
+        engine._sizing_equity = equity
+        engine._sizing_block = reason
+        if reason and getattr(engine, "_sizing_block_noted", None) != reason:
+            self.operational("sizing_blocked", asset=engine.spec.symbol, reason=reason)
+            engine._sizing_block_noted = reason
+
     def evaluate(self, engine, yes_prob: float, now: float | None = None) -> tuple[dict, dict | None]:
         """Decision and durable INTENDED, without the execution-book GET."""
         now = time.time() if now is None else now
@@ -197,6 +255,7 @@ class ShadowEntry:
             decision = engine._wait("no_market", yes_prob)
             return decision, self.stage_submission(engine, decision, yes_prob)
         engine._total_ticks += 1
+        self._apply_sizing_equity(engine)
         decision = engine.make_decision(yes_prob)
         return decision, self.stage_submission(engine, decision, yes_prob)
 

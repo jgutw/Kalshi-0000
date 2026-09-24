@@ -217,13 +217,19 @@ def _group_reason(reason):
     return reason
 
 
-def _equity(starting, closed_rows, open_rows) -> dict:
+def _equity(starting, closed_rows, open_rows, *, feeds_sizing: bool = False) -> dict:
     """Gross equity from the lifecycle. Fees stay unknown. Open positions are not marked.
 
     Realized equity is starting balance plus closed gross P&L. An open premium
     is still inside that number at cost. Cash is realized equity minus open premium.
-    This ledger does not change the sizer. The engine keeps using the frozen
-    starting balance for Kelly and the position cap.
+    ``exposure_pct_of_starting`` is premium divided by the starting balance. It is
+    not the dynamic exposure denominator.
+
+    ``equity_feeds_sizing`` is durable provenance from a ``sizing_basis`` event,
+    not a guess from the running code. When it is true, Kelly and the 30% cap use
+    this realized gross equity. When it is false, that session was sized from the
+    frozen starting balance. Shadow daily-loss and drawdown halts still watch
+    frozen ``sim.balance`` and are not realized-equity protection.
     """
     blank = {
         "available": False,
@@ -240,7 +246,7 @@ def _equity(starting, closed_rows, open_rows) -> dict:
         "cumulative_return": None,
         "fees": None,
         "net_equity": None,
-        "equity_feeds_sizing": False,
+        "equity_feeds_sizing": bool(feeds_sizing),
         "basis": "unavailable",
     }
     if type(starting) not in (int, float) or isinstance(starting, bool) or starting <= 0:
@@ -285,11 +291,15 @@ def _equity(starting, closed_rows, open_rows) -> dict:
         "cumulative_return": (running / start) - 1.0,
         "fees": None,
         "net_equity": None,
-        "equity_feeds_sizing": False,
+        "equity_feeds_sizing": bool(feeds_sizing),
         "basis": (
             "Gross realized equity. Open positions carried at cost, not marked. "
             "Fees unknown, so net equity is unavailable. "
-            "Sizing still uses the frozen starting balance."
+            + (
+                "Sizing uses this realized gross equity."
+                if feeds_sizing else
+                "Sizing still uses the frozen starting balance."
+            )
         ),
     }
 
@@ -405,7 +415,11 @@ def analyze(session_dir: Path, now: datetime | None = None) -> dict:
     intended = replay["intended"] if chain_ok else None
     not_filled = sum(count for name, count in dispositions.items() if name != FULL) if chain_ok else None
     perf = _performance(closed_rows) if chain_ok else None
-    equity = _equity(starting, closed_rows, open_rows) if chain_ok else None
+    feeds_sizing = any(
+        row.get("event") == "sizing_basis" and row.get("equity_feeds_sizing") is True
+        for row in operational
+    )
+    equity = _equity(starting, closed_rows, open_rows, feeds_sizing=feeds_sizing) if chain_ok else None
     if not chain_ok:
         open_rows = None
         closed_rows = None
@@ -540,7 +554,7 @@ def render(report: dict) -> str:
                 f"concurrent={equity['concurrent_open']} peak={equity['peak_realized_equity']} "
                 f"drawdown_usd={equity['drawdown_usd']} drawdown_pct={equity['drawdown_pct']} "
                 f"return={equity['cumulative_return']} fees=null net_equity=null "
-                "equity_feeds_sizing=false"
+                f"equity_feeds_sizing={str(equity['equity_feeds_sizing']).lower()}"
             )
         else:
             lines.append("equity unavailable")

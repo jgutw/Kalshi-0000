@@ -218,7 +218,10 @@ def _portfolio(report) -> None:
         dcols[1].metric("Drawdown %", _pct(equity["drawdown_pct"]))
         dcols[2].metric("Cumulative gross return", _pct(equity["cumulative_return"]))
         dcols[3].metric("Concurrent open", equity["concurrent_open"])
-        st.caption("equity_feeds_sizing = false. Sizing still uses the frozen starting balance.")
+        if equity["equity_feeds_sizing"]:
+            st.caption("equity_feeds_sizing = true. Kelly and the 30% cap use realized gross equity.")
+        else:
+            st.caption("equity_feeds_sizing = false. Sizing still uses the frozen starting balance.")
     st.markdown("**Open positions**")
     if report["open_positions"]:
         st.dataframe(report["open_positions"], width="stretch", hide_index=True)

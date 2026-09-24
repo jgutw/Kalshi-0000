@@ -307,9 +307,11 @@ class SimState:
         if eq > self.peak_equity:
             self.peak_equity = eq
 
-    def gross_open_exposure(self, open_positions: List[OpenPosition]) -> float:
+    def gross_open_exposure(self, open_positions: List[OpenPosition], denominator: Optional[float] = None) -> float:
         """Sum of all open position sizes as fraction of working capital."""
         total = sum(p.amount_usdc for p in open_positions)
+        if denominator is not None:
+            return total / denominator
         if not cfg.DRY_RUN:
             # Live: balance is Kalshi *available*; include open premium in denominator
             return total / max(float(self.balance) + total, 1.0)
@@ -433,13 +435,15 @@ class SimState:
 
     # ─── Trade recording ──────────────────────────────────────────────────────
 
-    def can_trade(self, size_usd: float, edge: float, min_edge: float, asset: Optional[str] = None) -> Tuple[bool, str]:
+    def can_trade(self, size_usd: float, edge: float, min_edge: float, asset: Optional[str] = None,
+                  bankroll: Optional[float] = None) -> Tuple[bool, str]:
         halted, reason = self.is_halted(asset)
         if halted:
             return False, reason
         if edge < min_edge:
             return False, f"edge {edge:.3f} < {min_edge:.3f}"
-        if size_usd > self.balance * cfg.MAX_POS_PCT + 0.01:
+        base = self.balance if bankroll is None else bankroll
+        if size_usd > base * cfg.MAX_POS_PCT + 0.01:
             return False, "size > limit"
         return True, "OK"
 

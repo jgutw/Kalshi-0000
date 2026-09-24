@@ -920,7 +920,10 @@ class AssetEngine:
         if 0.48 <= p_real <= 0.52:
             return self._wait("p_real_near_50", yes_price_raw, p_base=p_base, alpha_micro=alpha_micro)
 
-        # Portfolio cap: check before strategy (hard risk limit)
+        # Portfolio cap: check before strategy (hard risk limit).
+        # A sizing block stops new risk before Kelly, including when no peer engines are linked.
+        if getattr(self, "_sizing_block", None):
+            return self._wait(self._sizing_block, yes_price_raw, spot_now=spot_now, spot_start=spot_start)
         gross = 0.0            # also recorded in the C7 decision snapshot below
         concurrent_open = 0
         if self._all_engines:
@@ -929,7 +932,9 @@ class AssetEngine:
                 if e._open_pos is not None
             ]
             concurrent_open = len(all_positions)
-            gross = self.sim.gross_open_exposure(all_positions)
+            gross = self.sim.gross_open_exposure(
+                all_positions, denominator=getattr(self, "_sizing_equity", None),
+            )
             if gross + cfg.MAX_POS_PCT > cfg.PORTFOLIO_GROSS_CAP:
                 return self._wait(f"portfolio_cap({gross:.1%})", yes_price_raw, spot_now=spot_now, spot_start=spot_start)
             # Risk Update v1: never-exceed backstop. Windows above ~35% gross went
@@ -1068,14 +1073,15 @@ class AssetEngine:
         max_pos = cfg.MAX_POS_PCT
         if activity_probe:
             max_pos = min(max_pos, float(getattr(cfg, "ACTIVITY_PROBE_SIZE_PCT", 0.025)))
-        size_usd = min(self.sim.balance * frac, self.sim.balance * max_pos)
+        bankroll = self._sizing_bankroll()
+        size_usd = min(bankroll * frac, bankroll * max_pos)
         size_usd = max(0.0, size_usd)
 
         # Risk Update v1 lottery sleeve: cap dollars risked on cheap contracts and
         # limit how many can be open at once. No-op when LOTTERY_MAX_RISK_PCT = 0.
         lottery = is_lottery_entry(entry_for_size)
         if lottery:
-            cap = lottery_size_cap_usd(entry_for_size, self.sim.balance)
+            cap = lottery_size_cap_usd(entry_for_size, self._sizing_bankroll())
             if cap is not None:
                 size_usd = min(size_usd, cap)
             max_lotto = int(getattr(cfg, "LOTTERY_MAX_CONCURRENT", 0) or 0)
@@ -1093,7 +1099,9 @@ class AssetEngine:
                     d.update(attribution_fields)
                     return d
 
-        ok, reason = self.sim.can_trade(size_usd, abs(ev), min_edge, asset=self.spec.symbol)
+        ok, reason = self.sim.can_trade(
+            size_usd, abs(ev), min_edge, asset=self.spec.symbol, bankroll=self._sizing_bankroll(),
+        )
         if not ok:
             d = self._wait(reason, yes_price_raw, p_base=p_base, alpha_micro=alpha_micro, spot_now=spot_now, spot_start=spot_start)
             d.update(attribution_fields)
@@ -1321,6 +1329,19 @@ class AssetEngine:
 
     # ─── WAIT helper ─────────────────────────────────────────────────────────
 
+    def _sizing_bankroll(self) -> float:
+        """Production uses sim.balance. Shadow Era 1C sets _sizing_equity.
+
+        A block never falls back to the frozen balance. Callers stop at _sizing_block
+        before this; 0.0 is the second line so a missed check cannot size from the start.
+        """
+        if getattr(self, "_sizing_block", None):
+            return 0.0
+        equity = getattr(self, "_sizing_equity", None)
+        if equity is None:
+            return self.sim.balance
+        return equity
+
     def _wait(
         self,
         reason: str,
@@ -1434,7 +1455,8 @@ class AssetEngine:
         if not self.sim.try_claim_quota():
             return None
         pct = float(getattr(cfg, "QUOTA_SIZE_PCT", 0.02))
-        size_usd = max(0.0, min(self.sim.balance * pct, self.sim.balance * cfg.MAX_POS_PCT))
+        bankroll = self._sizing_bankroll()
+        size_usd = max(0.0, min(bankroll * pct, bankroll * cfg.MAX_POS_PCT))
         if size_usd < cfg.MIN_TRADE_USD:
             return None
         log.warning(

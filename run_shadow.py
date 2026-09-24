@@ -76,9 +76,14 @@ def open_session(args):
     if args.new:
         session = ShadowSession(
             args.root, args.session_id, args.session_tag, args.code_sha,
-            config_identity={"runner": "shadow-entry-4b"},
+            config_identity={"runner": "shadow-entry-4b", "equity_feeds_sizing": True},
         )
         record_starting_balance(session, args.starting_balance)
+        session.append("operational_events", {
+            "event": "sizing_basis",
+            "equity_feeds_sizing": True,
+            "basis": "realized_gross_equity",
+        })
         balance = float(args.starting_balance)
     else:
         session = ShadowSession.recover(args.root, args.session_id)
