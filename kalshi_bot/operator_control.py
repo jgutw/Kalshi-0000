@@ -446,9 +446,15 @@ def request_paper(chat_id: str, args: list[str], send: SendFn) -> None:
     if not 50 <= capital <= 100_000:
         send("PAPER — NO REAL CAPITAL\nCapital must be between $50 and $100000.")
         return
-    profile = args[1].strip().lower() if len(args) > 1 else "max_risk_paper"
-    if profile not in PROFILE_PRESETS:
-        send(f"Unknown profile. Allowed: {', '.join(PROFILE_PRESETS)}")
+    from kalshi_bot.telegram.rounds import resolve_profile
+    raw_profile = args[1].strip().lower() if len(args) > 1 else "max_risk_paper"
+    try:
+        profile = resolve_profile(raw_profile)
+    except ValueError:
+        send(
+            "Unknown profile. Use standard, micro, conservative, aggressive, tight, "
+            "or max_risk_paper, max_risk_micro, engineered_risk, live_safe, higher_sharpe."
+        )
         return
     conflict = _conflict(detect_modes())
     if conflict:
