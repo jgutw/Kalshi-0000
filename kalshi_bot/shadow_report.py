@@ -207,6 +207,16 @@ def _performance(closed: list[dict]) -> dict:
     }
 
 
+def _group_reason(reason):
+    """Collapse parameterized wait reasons for display. Exact strings stay in `reasons`."""
+    if not isinstance(reason, str):
+        return reason
+    for name in ("size_too_small", "entry_too_cheap", "entry_too_rich", "edge", "p_base_near_50"):
+        if reason == name or reason.startswith(name + "("):
+            return name
+    return reason
+
+
 def _equity(starting, closed_rows, open_rows) -> dict:
     """Gross equity from the lifecycle. Fees stay unknown. Open positions are not marked.
 
@@ -315,25 +325,43 @@ def analyze(session_dir: Path, now: datetime | None = None) -> dict:
     reasons = Counter(row.get("reason") for row in decisions)
     grouped = Counter()
     for reason, count in reasons.items():
-        if isinstance(reason, str) and (reason.startswith("edge(") or reason.startswith("p_base_near_50")):
-            key = reason.split("(", 1)[0]
-        else:
-            key = reason
-        grouped[key] += count
+        grouped[_group_reason(reason)] += count
     by_asset_decisions = Counter(row.get("asset") for row in decisions)
     hearts = [row for row in operational if row.get("event") == "heartbeat"]
     latest = {}
     for row in hearts:
         latest[row.get("asset")] = row
-    incidents = [
-        {"event": row.get("event"), "timestamp_utc": row.get("timestamp_utc"),
-         "asset": row.get("asset"), "feed": row.get("feed"), "error": row.get("error")}
-        for row in operational
-        if row.get("event") in {
-            "feed_stopped", "feed_failure", "price_feed_error", "uncaught_loop_error",
-            "settlement_error", "settlement_waiting", "simulation_rejected", "journal_intend_failed",
-        }
-    ]
+    incident_events = {
+        "feed_stopped", "feed_failure", "price_feed_error", "uncaught_loop_error",
+        "settlement_error", "settlement_waiting", "simulation_rejected", "journal_intend_failed",
+        "entry_not_constructed", "intention_already_consumed", "open_position_blocks_entry",
+        "entry_identity_unavailable", "entry_strategy_unavailable",
+    }
+    incidents = []
+    advisory_rejections = Counter()
+    for row in operational:
+        event = row.get("event")
+        if event == "journal_intend_failed":
+            advisory_rejections["intention_idempotency_rejection"] += 1
+        elif event == "entry_not_constructed":
+            advisory_rejections["entry_not_constructed:" + str(row.get("reason") or row.get("error") or "unknown")] += 1
+        elif event in (
+            "intention_already_consumed", "open_position_blocks_entry",
+            "entry_identity_unavailable", "entry_strategy_unavailable",
+        ):
+            advisory_rejections[event] += 1
+        if event not in incident_events:
+            continue
+        feed = row.get("feed")
+        known = event == "feed_stopped" and isinstance(feed, str) and feed.endswith(":binance")
+        incidents.append({
+            "class": "known_feed_exit" if known else "other",
+            "event": event,
+            "timestamp_utc": row.get("timestamp_utc"),
+            "asset": row.get("asset"),
+            "feed": feed,
+            "error": row.get("error") or row.get("reason"),
+        })
     closed_rows = []
     open_rows = []
     for position in replay["positions"]:
@@ -365,6 +393,9 @@ def analyze(session_dir: Path, now: datetime | None = None) -> dict:
             })
             closed_rows.append(view)
     dispositions = Counter(row.get("disposition") for row in replay["executions"])
+    execution_reasons = Counter(
+        (row.get("disposition"), row.get("reason")) for row in replay["executions"]
+    ) if chain_ok else None
     starting = next((row.get("starting_balance") for row in operational if row.get("event") == "starting_balance"), None)
     startup = metadata.get("startup_utc")
     shutdown = next((row.get("timestamp_utc") for row in reversed(operational) if row.get("event") == "shutdown"), None)
@@ -403,6 +434,10 @@ def analyze(session_dir: Path, now: datetime | None = None) -> dict:
             "BUY_NO": actions.get("BUY_NO", 0),
             "reasons": dict(reasons),
             "reason_groups": dict(grouped),
+            "reason_table": [
+                {"reason": key, "count": count, "pct_decisions": (count / len(decisions)) if decisions else None}
+                for key, count in sorted(grouped.items(), key=lambda item: (-item[1], str(item[0])))
+            ],
             "by_asset": dict(by_asset_decisions),
         },
         "funnel": {
@@ -413,6 +448,11 @@ def analyze(session_dir: Path, now: datetime | None = None) -> dict:
             "NO_FILL_NOT_MARKETABLE": dispositions.get("NO_FILL_NOT_MARKETABLE", 0) if chain_ok else None,
             "not_marketable_subset_of_not_filled": True,
             "dispositions": dict(dispositions) if chain_ok else None,
+            "execution_reasons": [
+                {"disposition": name, "reason": reason, "count": count}
+                for (name, reason), count in sorted(execution_reasons.items(), key=lambda item: (-item[1], str(item[0])))
+            ] if execution_reasons is not None else None,
+            "advisory_rejections": dict(advisory_rejections),
             "open": len(open_rows) if chain_ok else None,
             "closed": len(closed_rows) if chain_ok else None,
             "fills_per_action_signal": (filled / actionable) if chain_ok and actionable and filled is not None else None,
