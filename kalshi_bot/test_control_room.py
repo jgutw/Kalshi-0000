@@ -105,3 +105,13 @@ class TruthfulnessTests(unittest.TestCase):
         self.assertNotIn('title="Live', room)
         self.assertIn("Loss-streak ceiling: 3", (ROOT / "dashboard" / "pages" / "00_ops.py").read_text(encoding="utf-8"))
         self.assertNotIn("reconcile()", (ROOT / "dashboard" / "shadow_app.py").read_text(encoding="utf-8"))
+
+    def test_working_fills_ignore_earlier_sessions(self):
+        from dashboard.data.loaders import select_working_fills
+        started = "2026-09-25T11:02:23+00:00"
+        old = {"ts": "2026-08-15T19:48:09+00:00", "asset": "BTC", "ticker": "OLD", "side": "yes", "contracts": 1, "status": "open"}
+        current = {"ts": "2026-09-25T11:02:44+00:00", "asset": "ETH", "ticker": "NEW", "side": "no", "contracts": 2, "status": "open"}
+        positions = [{"ts": started, "asset": "ETH", "ticker": "NEW", "side": "no", "contracts": 2, "status": "open"}]
+        rows = select_working_fills(positions, [old, current], started)
+        self.assertEqual([row["ticker"] for row in rows], ["NEW"])
+        self.assertEqual(select_working_fills(positions, [old], None), positions)

@@ -172,16 +172,46 @@ def _trade_event_from_dict(t: dict) -> TradeEvent:
     )
 
 
-def load_working_fills() -> List[dict]:
-    """Open tickets from open_positions.json plus kalshi_fills.jsonl (status=open)."""
+def select_working_fills(positions: list[dict], fills: list[dict], started_at: str | None) -> list[dict]:
+    """Current-session opens only. A missing session start does not import older fill rows."""
     out: list[dict] = []
+    seen: set[tuple] = set()
+
+    def _add(row: dict) -> None:
+        key = (row.get("asset"), row.get("ticker"), row.get("side"), row.get("contracts"))
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(row)
+
+    for row in positions:
+        ts = str(row.get("ts") or "")
+        if started_at and ts and ts < started_at:
+            continue
+        _add(row)
+    if not started_at:
+        return out
+    for row in fills:
+        if row.get("status") != "open":
+            continue
+        ts = str(row.get("ts") or "")
+        if not ts or ts < started_at:
+            continue
+        _add(row)
+    return out
+
+
+def load_working_fills() -> List[dict]:
+    """Open tickets for the current production session, not older fill-log rows."""
+    positions: list[dict] = []
     pos_path = LOGS_DIR / "open_positions.json"
     try:
         if pos_path.exists() and pos_path.stat().st_size > 0:
             data = json.loads(pos_path.read_text(encoding="utf-8"))
+            snap_ts = data.get("ts") or ""
             for p in data.get("positions") or []:
-                out.append({
-                    "ts": data.get("ts") or "",
+                positions.append({
+                    "ts": snap_ts,
                     "asset": p.get("asset"),
                     "ticker": p.get("ticker") or p.get("market_ticker"),
                     "side": p.get("side"),
@@ -191,7 +221,8 @@ def load_working_fills() -> List[dict]:
                     "status": "open",
                 })
     except (OSError, json.JSONDecodeError):
-        pass
+        positions = []
+    fills: list[dict] = []
     fills_path = LOGS_DIR / "kalshi_fills.jsonl"
     try:
         if fills_path.exists():
@@ -201,14 +232,24 @@ def load_working_fills() -> List[dict]:
                     if not line:
                         continue
                     try:
-                        rec = json.loads(line)
+                        fills.append(json.loads(line))
                     except json.JSONDecodeError:
                         continue
-                    if rec.get("status") == "open":
-                        out.append(rec)
     except OSError:
-        pass
-    return out
+        fills = []
+    return select_working_fills(positions, fills, _session_started_at())
+
+
+def _session_started_at() -> str | None:
+    path = LOGS_DIR / "session_meta.json"
+    try:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if meta.get("active") is False or str(meta.get("session_tag") or "") == "idle":
+        return None
+    started = str(meta.get("started_at") or "").strip()
+    return started or None
 
 
 def load_trades() -> List[TradeEvent]:

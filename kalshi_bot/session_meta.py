@@ -38,6 +38,7 @@ ARCHIVE_LOG_FILES = (
     "runtime_control.json",
     "live_config.json",
     "open_positions.json",
+    "kalshi_fills.jsonl",
 )
 
 
@@ -279,6 +280,7 @@ def reset_logs_for_fresh_round() -> None:
         "kalshi_decisions.jsonl",
         "kalshi_events.jsonl",
         "kalshi_features.jsonl",
+        "kalshi_fills.jsonl",
         "near_misses.csv",
         "session_meta.json",
     ):
@@ -358,6 +360,7 @@ def mark_session_idle(last_archive: Optional[str] = None) -> None:
         "near_misses.csv",
         "kalshi_sim.json",
         "open_positions.json",
+        "kalshi_fills.jsonl",
         "live_config.json",
         "bot_heartbeat.json",
     ):

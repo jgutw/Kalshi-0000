@@ -29,7 +29,7 @@ st.caption("Closed trades — risked premium vs realized P&L. Working fills appe
 
 working = load_working_fills()
 if working:
-    st.subheader("Working fills (not settled)")
+    st.subheader("Working fills (this session, not settled)")
     wrows = []
     for p in working:
         wrows.append({
